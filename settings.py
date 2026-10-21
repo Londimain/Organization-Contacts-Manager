@@ -1,0 +1,45 @@
+# settings.py
+import os
+import sys
+import json
+
+def app_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+def data_dir():
+    # Папка для настроек и логов в системе (AppData/Roaming/ManagerContacts)
+    path = os.path.join(os.getenv('APPDATA') or os.path.expanduser('~'), 'ManagerContacts')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+# База данных всегда рядом с программой
+DB_PATH = os.path.join(app_dir(), 'contacts.db')
+
+# Настройки и логи в системной папке
+SETTINGS_PATH = os.path.join(data_dir(), 'settings.json')
+LOG_PATH = os.path.join(data_dir(), 'app.log')
+
+DEFAULT_SETTINGS = {
+    'window_size': [1400, 900],
+    'maximized': True,
+    'last_export_dir': '',
+}
+
+def load_settings():
+    if os.path.exists(SETTINGS_PATH):
+        try:
+            with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return {**DEFAULT_SETTINGS, **data}
+        except Exception:
+            pass
+    return dict(DEFAULT_SETTINGS)
+
+def save_settings(settings):
+    try:
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Failed to save settings: {e}")
