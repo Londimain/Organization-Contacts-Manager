@@ -83,4 +83,3 @@ pyinstaller --onefile --windowed --clean --name ManagerContacts --icon="ico/mana
 **Ильенков С.М.**
 
 Организация: ОАО "Компания МогНат"
-Год: 2026
