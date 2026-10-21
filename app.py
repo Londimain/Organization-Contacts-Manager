@@ -1,10 +1,12 @@
 # app.py
 import os
 import sys
+import re
 import logging
 from datetime import datetime
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
@@ -57,6 +59,13 @@ class ContactManagerApp(App):
         self.status_label = None
         self.header_labels = {}
         self._skip_deselect = False
+        
+        # --- Переменные для мультивыделения ---
+        self.selected_keys = []
+        self.anchor_index = None
+        self.current_index = None
+        self.shift_pressed = False
+        self.ctrl_pressed = False
 
     def build(self):
         self.title = 'Менеджер контактов организаций v1.1'
@@ -104,7 +113,7 @@ class ContactManagerApp(App):
                                     on_press=self.stop))
         root.add_widget(top)
 
-        # Шапка (теперь без сортировки и с выравниванием по центру)
+        # Шапка (без сортировки, по центру)
         header = BoxLayout(size_hint_y=None, height=35, spacing=0)
         with header.canvas.before:
             Color(*C_TABLE_HDR)
@@ -140,13 +149,14 @@ class ContactManagerApp(App):
         root.add_widget(header)
 
         # Таблица
-        self.scroll = ScrollView(do_scroll_x=False, bar_width=6)
+        self.scroll = ScrollView(do_scroll_x=False, bar_width=6, effect_cls='ScrollEffect')
         self.list_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=0)
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
         self.scroll.add_widget(self.list_layout)
+        self.scroll.bind(scroll_y=self._clamp_scroll_y) 
         root.add_widget(self.scroll)
 
-        # Панель действий (без Дублировать и Импорт)
+        # Панель действий 1
         row1 = BoxLayout(size_hint_y=None, height=46, spacing=8)
         self.add_btn = CustomButton(on_press=self.on_add)
         self.edit_btn = CustomButton(text='Редактировать', on_press=self.on_edit)
@@ -159,13 +169,13 @@ class ContactManagerApp(App):
             row1.add_widget(b)
         root.add_widget(row1)
 
-        # Служебная панель
+        # Панель действий 2
         row2 = BoxLayout(size_hint_y=None, height=40, spacing=8)
         row2.add_widget(CustomButton(text='Свернуть всё',
                                      on_press=lambda *_: self.collapse_all()))
         root.add_widget(row2)
 
-        # Статус-бар (без сортировки)
+        # Статус-бар
         self.status_label = Label(text='', size_hint_y=None, height=24,
                                   color=C_TEXT_DIM, font_size='13sp',
                                   halign='left', valign='middle', padding=(10, 0))
@@ -177,12 +187,12 @@ class ContactManagerApp(App):
                                size=lambda i, v: setattr(self.status_bg, 'size', v))
         root.add_widget(self.status_label)
 
-        Window.bind(on_key_down=self._on_key_down)
+        Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
 
         self.refresh_view()
         return root
 
-    # ---------- Keyboard ----------
+    # ---------- Keyboard & Multi-selection ----------
     def _has_text_focus(self):
         if self.root:
             for w in self.root.walk():
@@ -202,11 +212,41 @@ class ContactManagerApp(App):
         return False
 
     def _on_key_down(self, window, key, scancode, codepoint, modifiers):
+        if key in (304, 303) or 'shift' in modifiers:
+            self.shift_pressed = True
+        if key in (308, 306) or 'ctrl' in modifiers:
+            self.ctrl_pressed = True
+
         if 'ctrl' in modifiers and key == 102:  # Ctrl+F
             self.search_input.focus = True
             return True
+            
         if self._has_text_focus() or self._popup_open():
             return False
+
+        if 'ctrl' in modifiers and key == 99:  # Ctrl+C (Копировать)
+            self.copy_selected_to_clipboard()
+            return True
+
+        # Стрелки Вверх (273) и Вниз (274)
+        if key in (273, 274):
+            if self.current_index is not None and self.current_rows:
+                step = -1 if key == 273 else 1
+                new_index = self.current_index + step
+                
+                while 0 <= new_index < len(self.current_rows) and self.current_rows[new_index].is_header:
+                    new_index += step
+                
+                if 0 <= new_index < len(self.current_rows):
+                    self.current_index = new_index
+                    
+                    if 'shift' in modifiers or self.shift_pressed:
+                        self._select_range(single=False)
+                    else:
+                        self.anchor_index = self.current_index
+                        self._select_range(single=True)
+            return True
+
         if key == 13:   # Enter
             self.on_edit(); return True
         if key == 127:  # Delete
@@ -215,89 +255,168 @@ class ContactManagerApp(App):
             self.on_add(); return True
         return False
 
-    # ---------- Context menu ----------
-    def show_context_menu(self, node_type, db_id, touch):
-        # Оставлено для совместимости, но правый клик теперь копирует текст
-        pass
+    def _on_key_up(self, window, key, *args):
+        if key in (304, 303):
+            self.shift_pressed = False
+        if key in (308, 306):
+            self.ctrl_pressed = False
+        return False
 
-    def _copy_selected_cell(self):
-        pass
+    def handle_shift_click(self, row):
+        clicked_index = -1
+        for i, r in enumerate(self.current_rows):
+            if r == row:
+                clicked_index = i
+                break
+                
+        if clicked_index != -1:
+            self.current_index = clicked_index
+            if self.anchor_index is None:
+                self.anchor_index = clicked_index
+            self._select_range(single=False)
 
-    # ---------- CRUD helpers ----------
-    def _confirm_delete(self, node_type, db_id):
-        msg = {
-            'rp': 'Удалить ответственное лицо со всей информацией?',
-            'org': 'Удалить организацию со всеми магазинами?',
-            'store': 'Удалить магазин со всеми контактами?',
-            'contact_dm': 'Удалить контакт ЛПР?',
-            'contact_pay': 'Удалить контакт оплаты?',
-        }.get(node_type, 'Удалить?')
-        ConfirmPopup(msg, lambda: self._delete_by(node_type, db_id)).open()
-
-    def _delete_by(self, node_type, db_id):
-        if node_type == 'rp':
-            self.db.delete_responsible_person(db_id)
-        elif node_type == 'org':
-            self.db.delete_organization(db_id)
-        elif node_type == 'store':
-            self.db.delete_store(db_id)
-        else:
-            self.db.delete_contact(db_id)
-        self.refresh_view()
-
-    def on_change_contact_type(self, *args):
-        n = self.selected_node
-        if not n or n.node_type not in ('contact_dm', 'contact_pay'):
+    def handle_ctrl_click(self, row):
+        if row.is_header:
             return
-        
-        cur = self.db.get_contact(n.db_id)
-        if not cur:
-            return
-        
-        def do_change(t):
-            self._do_change_contact_type(n.db_id, t)
             
-        ContactTypePopup(
-            title='Сменить тип контакта',
-            current_type=cur['contact_type'],  # <--- Добавлена эта строка
-            on_choice=do_change
-        ).open()
+        key = (row.node_type, row.db_id)
         
-    def _do_change_contact_type(self, contact_id, new_type):
-        self.db.change_contact_type(contact_id, new_type)
-        self.refresh_view()
+        if key in self.selected_keys:
+            self.selected_keys.remove(key)
+            row.set_selected(False)
+        else:
+            self.selected_keys.append(key)
+            row.set_selected(True)
+            
+        for i, r in enumerate(self.current_rows):
+            if r == row:
+                self.current_index = i
+                self.anchor_index = i
+                break
+                
+        if len(self.selected_keys) == 1:
+            n_type, n_id = self.selected_keys[0]
+            self.selected_node = type('N', (), {'node_type': n_type, 'db_id': n_id})()
+        else:
+            self.selected_node = None
+            
+        self.update_buttons()
 
-    # ---------- Export / Integrity ----------
-    def export_data(self, *args):
-        export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
-        filepath = os.path.join(export_dir, 'contacts_export.xlsx')
+    def _select_range(self, single=False):
+        if self.anchor_index is None or self.current_index is None:
+            return
         
-        try:
-            os.makedirs(export_dir, exist_ok=True)
-            export_to_excel(self.db, filepath=filepath)
-            InfoPopup("Успех", f"Данные сохранены:\n{filepath}").open()
-        except PermissionError:
-            InfoPopup("Ошибка", 
-                      f"Не удалось сохранить файл.\n\n"
-                      f"Файл открыт в другой программе (например, в Excel):\n"
-                      f"{filepath}\n\n"
-                      f"Закройте файл и повторите попытку.").open()
-        except Exception as e:
-            log.exception("Export failed")
-            InfoPopup("Ошибка", f"Не удалось сохранить файл.\n\n{e}").open()
+        if single:
+            start, end = self.current_index, self.current_index
+        else:
+            start = min(self.anchor_index, self.current_index)
+            end = max(self.anchor_index, self.current_index)
+            
+        self.selected_keys = []
+        for i in range(start, end + 1):
+            row = self.current_rows[i]
+            if not row.is_header:
+                self.selected_keys.append((row.node_type, row.db_id))
+                
+        for i, row in enumerate(self.current_rows):
+            if row.is_header:
+                row.set_selected(False)
+            else:
+                row.set_selected(start <= i <= end)
+                
+        if len(self.selected_keys) == 1:
+            n_type, n_id = self.selected_keys[0]
+            self.selected_node = type('N', (), {'node_type': n_type, 'db_id': n_id})()
+        else:
+            self.selected_node = None
+            
+        self.update_buttons()
+        
+        if self.current_index < len(self.current_rows):
+            target_row = self.current_rows[self.current_index]
+            
+            if hasattr(self, '_scroll_event') and self._scroll_event:
+                self._scroll_event.cancel()
+                
+            def safe_scroll(dt):
+                row_y, row_top = target_row.to_window(0, target_row.y)[1], target_row.to_window(0, target_row.top)[1]
+                view_y, view_top = self.scroll.to_window(0, self.scroll.y)[1], self.scroll.to_window(0, self.scroll.top)[1]
+                
+                if row_y < view_y or row_top > view_top:
+                    self.scroll.scroll_to(target_row, padding=0, animate=False)
+                    
+            self._scroll_event = Clock.schedule_once(safe_scroll, 0.02)
 
-    def show_trash(self, *args):
-        TrashPopup(self.db, self.refresh_view).open()
+    def copy_selected_to_clipboard(self):
+        if not self.selected_keys:
+            return
+        
+        lines = []
+        for row in self.current_rows:
+            if (row.node_type, row.db_id) in self.selected_keys and not row.is_header:
+                cells = []
+                
+                # 1 и 2 колонки: отдельно тип и отдельно имя
+                col1_children = row.col1_box.children
+                if len(col1_children) >= 2:
+                    cells.append(col1_children[1].text)
+                    cells.append(col1_children[0].text)
+                elif len(col1_children) == 1:
+                    cells.append("")
+                    cells.append(col1_children[0].text)
+                else:
+                    cells.append("")
+                    cells.append("")
+                
+                # 3-6 колонки
+                for lbl in (row.lbl2, row.lbl3, row.lbl4, row.lbl5):
+                    cells.append(lbl.text)
+                    
+                clean_cells = []
+                for c in cells:
+                    # Очистка от разметки Kivy
+                    clean = re.sub(r'\[.*?\]', '', str(c))
+                    clean = clean.replace('&amp;', '&').replace('&bl;', '[').replace('&br;', ']')
+                    clean = clean.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').strip()
+                    
+                    # Добавляем невидимый пробел, чтобы Excel выровнял по левому краю
+                    if clean and clean != '-':
+                        clean = clean + "\u00A0"
+                        
+                    clean_cells.append(clean)
+                    
+                lines.append("\t".join(clean_cells))
+        
+        if lines:
+            Clipboard.copy("\r\n".join(lines))
 
-    # ---------- Selection ----------
     def deselect_all(self):
         self.selected_node = None
         self.selected_key = None
+        self.selected_keys = []
+        self.anchor_index = None
+        self.current_index = None
+        
         for row in self.current_rows:
             row.set_selected(False)
             for child in row.walk():
                 if isinstance(child, Label) and hasattr(child, '_orig_color'):
                     child.color = child._orig_color
+        self.update_buttons()
+
+    def select_row(self, node_type, db_id):
+        self.selected_key = (node_type, db_id)
+        self.selected_keys = [(node_type, db_id)]
+        self.selected_node = type('N', (), {'node_type': node_type, 'db_id': db_id})()
+        
+        for i, row in enumerate(self.current_rows):
+            if row.node_type == node_type and row.db_id == db_id:
+                self.anchor_index = i
+                self.current_index = i
+                row.set_selected(True)
+            else:
+                row.set_selected(False)
+                
         self.update_buttons()
 
     def toggle_expand(self, node_type, db_id):
@@ -306,53 +425,61 @@ class ContactManagerApp(App):
             self.expanded.remove(key)
         else:
             self.expanded.add(key)
+        
         self.refresh_view(keep_scroll=True, keep_selection=True)
-        self.select_row(node_type, db_id)
+        
+        for i, row in enumerate(self.current_rows):
+            if (row.node_type, row.db_id) == (node_type, db_id):
+                self.anchor_index = i
+                self.current_index = i
+                break
+        self.update_buttons()
 
     def collapse_all(self):
         self.expanded.clear()
         self.refresh_view()
 
-    def select_row(self, node_type, db_id):
-        self.selected_key = (node_type, db_id)
-        for row in self.current_rows:
-            row.set_selected(row.node_type == node_type and row.db_id == db_id)
-        self.selected_node = type('N', (), {'node_type': node_type, 'db_id': db_id})()
-        self.update_buttons()
-
     def update_buttons(self):
         n = self.selected_node
-        has = n is not None
-        if not has:
+        count = len(self.selected_keys)
+        has = count > 0
+        
+        if count == 0:
             self.add_btn.text = 'Добавить ответственного'
-        elif n.node_type == 'rp':
-            self.add_btn.text = 'Добавить организацию'
-        elif n.node_type == 'org':
-            self.add_btn.text = 'Добавить магазин'
-        elif n.node_type == 'store':
-            self.add_btn.text = 'Добавить контакт'
+            self.add_btn.disabled = False
+        elif count == 1:
+            if n and n.node_type == 'rp':
+                self.add_btn.text = 'Добавить организацию'
+            elif n and n.node_type == 'org':
+                self.add_btn.text = 'Добавить магазин'
+            elif n and n.node_type == 'store':
+                self.add_btn.text = 'Добавить контакт'
+            else:
+                self.add_btn.text = 'Добавить'
+            self.add_btn.disabled = False
         else:
             self.add_btn.text = 'Добавить'
+            self.add_btn.disabled = True
             
-        self.edit_btn.disabled = not has
         self.delete_btn.disabled = not has
+        self.edit_btn.disabled = (count != 1)
         
-        if has and n.node_type in ('contact_dm', 'contact_pay'):
+        if count == 1 and n and n.node_type in ('contact_dm', 'contact_pay'):
             self.change_type_btn.disabled = False
         else:
             self.change_type_btn.disabled = True
 
-        # Эту строку нужно УДАЛИТЬ:
-        # self.new_rp_btn.disabled = has
-
-    # ---------- Refresh ----------
     def refresh_view(self, keep_scroll=False, keep_selection=False):
         scroll_y = self.scroll.scroll_y if keep_scroll else 1.0
         self.list_layout.clear_widgets()
         self.current_rows.clear()
+        
         if not keep_selection:
             self.selected_node = None
             self.selected_key = None
+            self.selected_keys = []
+            self.anchor_index = None
+            self.current_index = None
 
         text = self.search_input.text.strip() if self.search_input else ''
         if text:
@@ -360,11 +487,16 @@ class ContactManagerApp(App):
         else:
             self._build_full()
 
+        for row in self.current_rows:
+            if not row.is_header and (row.node_type, row.db_id) in self.selected_keys:
+                row.set_selected(True)
+            else:
+                row.set_selected(False)
+
         self.update_buttons()
         self._update_status()
         
-        # Теперь прокрутка наверх (или сохранение позиции) срабатывает ВСЕГДА
-        Clock.schedule_once(lambda dt: setattr(self.scroll, 'scroll_y', scroll_y), 0.05)
+        Clock.schedule_once(lambda dt: setattr(self.scroll, 'scroll_y', max(0.0, min(1.0, scroll_y))), 0.05)
 
     def _update_status(self):
         if not self.status_label:
@@ -388,8 +520,7 @@ class ContactManagerApp(App):
             orgs = self.db.get_organizations(rp['id'], self.sort_key, self.sort_dir)
             is_exp = ('rp', rp['id']) in self.expanded
             self._row('rp', rp['id'], 0,
-                      [("Ответственный", 0.35),
-                       (f"{rp['full_name']} ({len(orgs)})", 0.65)],
+                      [("Ответственный", 0.35), (rp['full_name'], 0.65)],
                       rp['city'] or '-', '', rp['position'] or '-', rp['phone'] or '-',
                       expandable=True, expanded=is_exp)
             if is_exp:
@@ -397,24 +528,27 @@ class ContactManagerApp(App):
                     stores = self.db.get_stores(org['id'], self.sort_key, self.sort_dir)
                     is_exp_org = ('org', org['id']) in self.expanded
                     self._row('org', org['id'], 1,
-                              [("Организация", 0.35),
-                               (f"{org['name']} ({len(stores)})", 0.65)],
+                              [("Организация", 0.35), (org['name'], 0.65)],
                               org['contract_number'] or '-',
                               org['contract_date'] or '-',
                               org['address'] or '-', org['phone'] or '-',
                               expandable=True, expanded=is_exp_org)
                     if is_exp_org:
                         for st in stores:
-                            contacts = self.db.get_all_contacts(st['id'])
                             is_exp_st = ('store', st['id']) in self.expanded
                             self._row('store', st['id'], 2,
-                                      [("Магазин", 0.35),
-                                       (f"{st['name']} ({len(contacts)})", 0.65)],
+                                      [("Магазин", 0.35), (st['name'], 0.65)],
                                       '', '', st['unloading_address'] or '-',
                                       st['phone'] or '-',
                                       expandable=True, expanded=is_exp_st)
                             if is_exp_st:
                                 self._add_store_children(st)
+                                
+    def _clamp_scroll_y(self, instance, value):
+        if value > 1.0:
+            instance.scroll_y = 1.0
+        elif value < 0.0:
+            instance.scroll_y = 0.0
 
     def _add_store_children(self, store):
         self._row('header', 0, 3, [("Контакты ЛПР", 1.0)], '', '', '', '',
@@ -495,6 +629,7 @@ class ContactManagerApp(App):
 
     # ---------- Actions ----------
     def on_add(self, *args):
+        if len(self.selected_keys) > 1: return
         n = self.selected_node
         if not n:
             self._add_rp()
@@ -506,6 +641,7 @@ class ContactManagerApp(App):
             ContactTypePopup(on_choice=lambda t: self._add_contact(n.db_id, t)).open()
 
     def on_edit(self, *args):
+        if len(self.selected_keys) != 1: return
         n = self.selected_node
         if not n: return
         {'rp': self._edit_rp, 'org': self._edit_org, 'store': self._edit_store,
@@ -513,11 +649,96 @@ class ContactManagerApp(App):
          }.get(n.node_type, lambda x: None)(n.db_id)
 
     def on_delete(self, *args):
-        n = self.selected_node
-        if n:
+        if len(self.selected_keys) == 0: return
+        
+        if len(self.selected_keys) == 1:
+            n = self.selected_node
             self._confirm_delete(n.node_type, n.db_id)
+        else:
+            ConfirmPopup(f"Удалить выбранные элементы ({len(self.selected_keys)} шт.)?", 
+                         self._delete_selected).open()
 
-    # ---------- Add/Edit forms ----------
+    def _delete_selected(self):
+        order = {'contact_dm': 4, 'contact_pay': 4, 'store': 3, 'org': 2, 'rp': 1}
+        sorted_keys = sorted(self.selected_keys, key=lambda x: order.get(x[0], 0), reverse=True)
+        
+        for n_type, n_id in sorted_keys:
+            if n_type in ('contact_dm', 'contact_pay'):
+                self.db.delete_contact(n_id)
+            elif n_type == 'store':
+                self.db.delete_store(n_id)
+            elif n_type == 'org':
+                self.db.delete_organization(n_id)
+            elif n_type == 'rp':
+                self.db.delete_responsible_person(n_id)
+                
+        self.refresh_view()
+
+    def _confirm_delete(self, node_type, db_id):
+        msg = {
+            'rp': 'Удалить ответственное лицо со всей информацией?',
+            'org': 'Удалить организацию со всеми магазинами?',
+            'store': 'Удалить магазин со всеми контактами?',
+            'contact_dm': 'Удалить контакт ЛПР?',
+            'contact_pay': 'Удалить контакт оплаты?',
+        }.get(node_type, 'Удалить?')
+        ConfirmPopup(msg, lambda: self._delete_by(node_type, db_id)).open()
+
+    def _delete_by(self, node_type, db_id):
+        if node_type == 'rp':
+            self.db.delete_responsible_person(db_id)
+        elif node_type == 'org':
+            self.db.delete_organization(db_id)
+        elif node_type == 'store':
+            self.db.delete_store(db_id)
+        else:
+            self.db.delete_contact(db_id)
+        self.refresh_view()
+
+    def on_change_contact_type(self, *args):
+        if len(self.selected_keys) != 1: return
+        n = self.selected_node
+        if not n or n.node_type not in ('contact_dm', 'contact_pay'):
+            return
+        
+        cur = self.db.get_contact(n.db_id)
+        if not cur:
+            return
+        
+        def do_change(t):
+            self._do_change_contact_type(n.db_id, t)
+            
+        ContactTypePopup(
+            title='Сменить тип контакта',
+            current_type=cur['contact_type'],
+            on_choice=do_change
+        ).open()
+        
+    def _do_change_contact_type(self, contact_id, new_type):
+        self.db.change_contact_type(contact_id, new_type)
+        self.refresh_view()
+
+    def export_data(self, *args):
+        export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
+        filepath = os.path.join(export_dir, 'contacts_export.xlsx')
+        
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            export_to_excel(self.db, filepath=filepath)
+            InfoPopup("Успех", f"Данные сохранены:\n{filepath}").open()
+        except PermissionError:
+            InfoPopup("Ошибка", 
+                      f"Не удалось сохранить файл.\n\n"
+                      f"Файл открыт в другой программе (например, в Excel):\n"
+                      f"{filepath}\n\n"
+                      f"Закройте файл и повторите попытку.").open()
+        except Exception as e:
+            log.exception("Export failed")
+            InfoPopup("Ошибка", f"Не удалось сохранить файл.\n\n{e}").open()
+
+    def show_trash(self, *args):
+        TrashPopup(self.db, self.refresh_view).open()
+
     def _add_rp(self):
         def save(data):
             if not data['full_name']:
@@ -527,7 +748,7 @@ class ContactManagerApp(App):
             self.refresh_view()
             self.select_row('rp', new_id)
             return True
-        FormPopup('Новое отв. лицо',
+        FormPopup('Новое ответственное лицо',
                   [('full_name', 'ФИО'), ('city', 'Город'),
                    ('position', 'Должность'), ('phone', 'Телефон')],
                   save, validators={'phone': _phone_validator}).open()

@@ -2,6 +2,7 @@
 import webbrowser
 import os
 from datetime import datetime
+from kivy.clock import Clock  # <--- ВАЖНО: Импорт для обновления корзины
 from kivy.uix.popup import Popup
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
@@ -110,13 +111,18 @@ class FormPopup(Popup):
 class ConfirmPopup(Popup):
     def __init__(self, text, on_confirm, **kwargs):
         super().__init__(**kwargs)
-        self.title = 'Подтверждение'
+        self.title = 'Подтверждение на удаление'
         self.size_hint = (0.5, 0.3)
+        self.pos_hint = {'center_x': 0.5, 'center_y': 0.5}
         self.on_confirm_cb = on_confirm
+        
         box = BoxLayout(orientation='vertical', padding=15, spacing=15)
-        lbl = Label(text=text, halign='center', color=C_TEXT)
+        
+        # Добавлен valign='middle' чтобы текст был по центру
+        lbl = Label(text=text, halign='center', valign='middle', color=C_TEXT)
         lbl.bind(size=lbl.setter('text_size'))
         box.add_widget(lbl)
+        
         btns = BoxLayout(size_hint_y=None, height=45, spacing=10)
         yes = CustomButton(text='Удалить')
         yes.bind(on_press=self._confirm)
@@ -124,12 +130,14 @@ class ConfirmPopup(Popup):
         no.bind(on_press=lambda *_: self.dismiss())
         btns.add_widget(yes)
         btns.add_widget(no)
+        
         box.add_widget(btns)
         self.content = box
 
     def _confirm(self, *a):
         self.on_confirm_cb()
         self.dismiss()
+
 
 class ContactTypePopup(Popup):
     def __init__(self, on_choice, title='Тип контакта', current_type=None, **kwargs):
@@ -162,6 +170,7 @@ class ContactTypePopup(Popup):
     def _choose(self, t):
         self.on_choice_cb(t)
         self.dismiss()
+
 
 class AboutPopup(Popup):
     def __init__(self, text, repo_url="https://github.com/", **kwargs):
@@ -199,6 +208,7 @@ class InfoPopup(Popup):
         close.bind(on_press=lambda *_: self.dismiss())
         box.add_widget(close)
         self.content = box
+
 
 class SaveFilePopup(Popup):
     def __init__(self, on_save, initial_path=None, default_name='contacts_export.xlsx', **kwargs):
@@ -243,8 +253,6 @@ class SaveFilePopup(Popup):
         self.content = layout
 
     def _save(self, *a):
-        # Базовая папка — либо выбранная в chooser (если это папка),
-        # либо текущая открытая папка
         path = self.chooser.path
         if self.chooser.selection:
             sel = self.chooser.selection[0]
@@ -256,6 +264,40 @@ class SaveFilePopup(Popup):
         self.on_save_cb(os.path.join(path, name))
         self.dismiss()
 
+
+class TrashItem(BoxLayout):
+    def __init__(self, node_type, db_id, text, on_select, **kwargs):
+        super().__init__(orientation='horizontal', size_hint_y=None, height=40, spacing=5, **kwargs)
+        self.node_type = node_type
+        self.db_id = db_id
+        self.on_select = on_select
+        self.is_selected = False
+        
+        # Внутренний отступ слева, чтобы текст не прилипал к краю
+        self.lbl = Label(text=text, color=C_TEXT, halign='left', valign='middle', padding=(20, 0))
+        self.lbl.bind(size=self.lbl.setter('text_size'))
+        self.add_widget(self.lbl)
+        
+        with self.canvas.before:
+            self.bg_color = Color(*C_BG)
+            self.bg_rect = Rectangle(pos=self.pos, size=self.size)
+        self.bind(pos=self._upd, size=self._upd)
+        
+    def _upd(self, *a):
+        self.bg_rect.pos = self.pos
+        self.bg_rect.size = self.size
+
+    def set_selected(self, state):
+        self.is_selected = state
+        self.bg_color.rgba = C_SELECTED if state else C_BG
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            self.on_select(self)
+            return True
+        return super().on_touch_down(touch)
+
+
 class TrashPopup(Popup):
     def __init__(self, db, on_changed, **kwargs):
         super().__init__(**kwargs)
@@ -263,62 +305,84 @@ class TrashPopup(Popup):
         self.on_changed = on_changed
         self.title = 'Корзина'
         self.size_hint = (0.7, 0.8)
+        self.selected_items = []
         self._build()
 
     def _build(self):
         layout = BoxLayout(orientation='vertical', padding=15, spacing=10)
-        items = self.db.get_deleted_items()
-
-        if not items:
-            lbl = Label(text='Корзина пуста', color=C_TEXT_DIM)
-            layout.add_widget(lbl)
-        else:
-            scroll = ScrollView()
-            lst = BoxLayout(orientation='vertical', size_hint_y=None, spacing=4)
-            lst.bind(minimum_height=lst.setter('height'))
-            type_names = {'rp': 'Ответственный', 'org': 'Организация',
-                          'store': 'Магазин', 'contact': 'Контакт'}
-            for node_type, db_id, name, deleted_at in items:
-                row = BoxLayout(size_hint_y=None, height=40, spacing=5)
-                row.add_widget(Label(text=f"[{type_names[node_type]}] {name}  ({deleted_at})",
-                                     color=C_TEXT, halign='left', valign='middle'))
-                rest = CustomButton(text='Восстановить', size_hint_x=None, width=140)
-                rest.bind(on_press=lambda inst, t=node_type, i=db_id:
-                          self._restore(t, i))
-                pur = CustomButton(text='Удалить навсегда', size_hint_x=None, width=160)
-                pur.bind(on_press=lambda inst, t=node_type, i=db_id:
-                         self._purge(t, i))
-                row.add_widget(rest)
-                row.add_widget(pur)
-                lst.add_widget(row)
-            scroll.add_widget(lst)
-            layout.add_widget(scroll)
+        
+        self.scroll = ScrollView()
+        self.lst = BoxLayout(orientation='vertical', size_hint_y=None, spacing=4)
+        self.lst.bind(minimum_height=self.lst.setter('height'))
+        self.scroll.add_widget(self.lst)
+        layout.add_widget(self.scroll)
 
         btns = BoxLayout(size_hint_y=None, height=45, spacing=10)
-        purge_all = CustomButton(text='Очистить корзину')
-        purge_all.bind(on_press=self._purge_all)
-        close = CustomButton(text='Закрыть')
-        close.bind(on_press=lambda *_: self.dismiss())
+        restore_btn = CustomButton(text='Восстановить выбранные', on_press=self._restore)
+        purge_all = CustomButton(text='Очистить корзину', on_press=self._purge_all)
+        close = CustomButton(text='Закрыть', on_press=lambda *_: self.dismiss())
+        
+        btns.add_widget(restore_btn)
         btns.add_widget(purge_all)
         btns.add_widget(close)
         layout.add_widget(btns)
+        
         self.content = layout
+        self._populate_list()
 
-    def _restore(self, t, i):
-        self.db.restore_item(t, i)
-        self.on_changed()
-        self._refresh()
+    def _populate_list(self):
+        self.lst.clear_widgets()
+        self.selected_items.clear()
+        items = self.db.get_deleted_items()
 
-    def _purge(self, t, i):
-        self.db.purge_item(t, i)
+        if not items:
+            self.lst.add_widget(Label(text='Корзина пуста', color=C_TEXT_DIM, size_hint_y=None, height=40))
+            return
+
+        type_names = {'rp': 'Ответственный', 'org': 'Организация',
+                      'store': 'Магазин', 'contact': 'Контакт'}
+        for node_type, db_id, name, deleted_at in items:
+            text = f"[{type_names[node_type]}] {name}  ({deleted_at})"
+            item = TrashItem(node_type, db_id, text, self._toggle_select)
+            self.lst.add_widget(item)
+
+    def on_touch_down(self, touch):
+        # Сбрасываем выделение ТОЛЬКО если кликнули по пустому месту (не по строке и не по кнопке)
+        if self.collide_point(*touch.pos):
+            clicked_on_interactive = False
+            for w in self.walk():
+                if isinstance(w, (TrashItem, CustomButton)) and w.collide_point(*touch.pos):
+                    clicked_on_interactive = True
+                    break
+            if not clicked_on_interactive:
+                self._clear_selection()
+        return super().on_touch_down(touch)
+
+    def _clear_selection(self):
+        for item in self.selected_items:
+            item.set_selected(False)
+        self.selected_items.clear()
+
+    def _toggle_select(self, item):
+        if item in self.selected_items:
+            self.selected_items.remove(item)
+            item.set_selected(False)
+        else:
+            self.selected_items.append(item)
+            item.set_selected(True)
+
+    def _restore(self, *args):
+        if not self.selected_items:
+            return
+            
+        for item in self.selected_items:
+            self.db.restore_item(item.node_type, item.db_id)
+            
         self.on_changed()
-        self._refresh()
+        # Откладываем обновление интерфейса на 0.01 сек, чтобы кнопка успела "отпуститься" и запись исчезла
+        Clock.schedule_once(lambda dt: self._populate_list(), 0.01)
 
     def _purge_all(self, *args):
         self.db.purge_all_deleted()
         self.on_changed()
-        self._refresh()
-
-    def _refresh(self):
-        self.dismiss()
-        TrashPopup(self.db, self.on_changed).open()
+        Clock.schedule_once(lambda dt: self._populate_list(), 0.01)

@@ -4,6 +4,7 @@ import re
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
+from kivy.core.window import Window
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
@@ -162,7 +163,6 @@ class ExcelRow(BoxLayout):
 
         pad_left = level * 15 + 10
         for i, (text, weight) in enumerate(col1_parts):
-            # В заголовках (is_header) текст по центру, в остальных — по левому краю
             align = 'center' if is_header else 'left'
             lbl = Label(text=_make_text(text, highlight, markup=True),
                         size_hint_x=weight, halign=align, valign='middle',
@@ -235,9 +235,18 @@ class ExcelRow(BoxLayout):
             is_right = getattr(touch, 'button', None) == 'right'
             now = time.time()
             is_double = (now - self.last_click_time) < 0.3
+            
+            # Читаем модификаторы напрямую из системы (защита от залипания)
+            sys_modifiers = getattr(Window._system_keyboard, 'modifiers', [])
+            shift_held = 'shift' in sys_modifiers
+            ctrl_held = 'ctrl' in sys_modifiers
+            
+            # Синхронизируем состояние в программе
+            if not shift_held: app.shift_pressed = False
+            if not ctrl_held: app.ctrl_pressed = False
 
-            # Правый клик или двойной клик → копирование текста ячейки
-            if is_right or is_double or touch.is_double_tap:
+            # Правый клик или двойной клик (без Shift/Ctrl) → копирование текста
+            if is_right or (is_double and not shift_held and not ctrl_held):
                 if self.is_header:
                     return True
                     
@@ -269,10 +278,16 @@ class ExcelRow(BoxLayout):
             self.last_click_time = now
 
             if not self.is_header:
-                app.select_row(self.node_type, self.db_id)
+                # --- ЛОГИКА МУЛЬТИВЫДЕЛЕНИЯ ---
+                if ctrl_held:
+                    app.handle_ctrl_click(self)
+                elif shift_held:
+                    app.handle_shift_click(self)
+                else:
+                    app.select_row(self.node_type, self.db_id)
 
             # Разворачивание — при клике в любом месте строки, если есть +/-
-            if self.toggle_lbl.text in ('+', '-'):
+            if self.toggle_lbl.text in ('+', '-') and not ctrl_held and not shift_held:
                 if self._expand_event:
                     self._expand_event.cancel()
                 self._expand_event = Clock.schedule_once(
