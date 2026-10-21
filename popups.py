@@ -1,9 +1,12 @@
 import webbrowser
+import os
 from kivy.uix.popup import Popup
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.filechooser import FileChooserListView
+from kivy.graphics import Color, Rectangle
 from widgets import CustomButton
 from constants import *
 
@@ -141,7 +144,6 @@ class AboutPopup(Popup):
         self.content = layout
 
 
-# --- НОВОЕ ОКНО С СООБЩЕНИЕМ ---
 class InfoPopup(Popup):
     def __init__(self, title, text, **kwargs):
         super().__init__(**kwargs)
@@ -158,3 +160,53 @@ class InfoPopup(Popup):
         box.add_widget(close_btn)
         
         self.content = box
+
+
+# --- НОВОЕ ОКНО СОХРАНЕНИЯ ФАЙЛА ---
+class SaveFilePopup(Popup):
+    def __init__(self, on_save, **kwargs):
+        super().__init__(**kwargs)
+        self.title = 'Укажите место для сохранения'
+        self.size_hint = (0.9, 0.9)
+        self.on_save_cb = on_save
+        
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        
+        # Темный фон для попапа
+        with layout.canvas.before:
+            Color(*C_BG)
+            self.bg_rect = Rectangle(pos=layout.pos, size=layout.size)
+        layout.bind(pos=lambda i, v: setattr(self.bg_rect, 'pos', v),
+                    size=lambda i, v: setattr(self.bg_rect, 'size', v))
+        
+        # Выбор файла (по умолчанию открывается папка пользователя)
+        self.chooser = FileChooserListView(
+            filters=['*.xlsx'],
+            path=os.path.expanduser('~')
+        )
+        layout.add_widget(self.chooser)
+        
+        btns = BoxLayout(size_hint_y=None, height=45, spacing=10)
+        save_btn = CustomButton(text='Сохранить')
+        save_btn.bind(on_press=self._save)
+        cancel_btn = CustomButton(text='Отмена')
+        cancel_btn.bind(on_press=lambda *_: self.dismiss())
+        
+        btns.add_widget(save_btn)
+        btns.add_widget(cancel_btn)
+        layout.add_widget(btns)
+        
+        self.content = layout
+
+    def _save(self, *args):
+        path = self.chooser.path
+        filename = self.chooser.filename
+        
+        if not filename:
+            filename = "contacts_export.xlsx"
+        elif not filename.endswith('.xlsx'):
+            filename += '.xlsx'
+            
+        full_path = os.path.join(path, filename)
+        self.on_save_cb(full_path)
+        self.dismiss()

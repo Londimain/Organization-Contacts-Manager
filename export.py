@@ -1,13 +1,35 @@
 # export.py
 import openpyxl
 from openpyxl.styles import Border, Side, Alignment, Font
-from datetime import datetime
 import os
+
+def get_desktop_path():
+    """Возвращает путь к рабочему столу пользователя."""
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if os.path.exists(desktop):
+        return desktop
+    
+    # Для русскоязычных систем
+    desktop_ru = os.path.join(os.path.expanduser("~"), "Рабочий стол")
+    if os.path.exists(desktop_ru):
+        return desktop_ru
+        
+    # Если ничего не нашли, сохраняем в домашнюю директорию
+    return os.path.expanduser("~")
 
 def export_to_excel(db, filepath=None):
     if not filepath:
-        filename = f"contacts_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        filepath = os.path.abspath(filename)
+        # Определяем папку "Экспорт контактов" на рабочем столе
+        desktop = get_desktop_path()
+        export_dir = os.path.join(desktop, "Экспорт контактов")
+        
+        # Создаем папку, если её нет
+        if not os.path.exists(export_dir):
+            os.makedirs(export_dir)
+            
+        # Фиксированное имя файла (без даты)
+        filename = "contacts_export.xlsx"
+        filepath = os.path.join(export_dir, filename)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -43,11 +65,9 @@ def export_to_excel(db, filepath=None):
         for cell in row:
             cell.border = thin_border
             if cell.row == 1:
-                # Стили для шапки
                 cell.font = header_font
                 cell.alignment = align_center
             else:
-                # Стили для обычных строк
                 cell.alignment = align_left
 
     # Настройка ширины колонок
@@ -57,5 +77,6 @@ def export_to_excel(db, filepath=None):
     ws.column_dimensions['D'].width = 35
     ws.column_dimensions['E'].width = 20
 
+    # Сохраняем файл (openpyxl автоматически перезапишет его, если он существует)
     wb.save(filepath)
     return filepath

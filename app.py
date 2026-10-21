@@ -12,6 +12,7 @@ from kivy.graphics import Color, Rectangle, Line
 from database import Database
 from constants import *
 from widgets import CustomButton, RootLayout, ExcelRow
+# Убираем импорт SaveFilePopup, так как он больше не нужен
 from popups import FormPopup, ConfirmPopup, ContactTypePopup, AboutPopup, InfoPopup
 from about import ABOUT_TEXT
 from export import export_to_excel
@@ -29,7 +30,6 @@ class ContactManagerApp(App):
     selected_node = None
 
     def build(self):
-        # ИЗМЕНЕНО НАЗВАНИЕ ПРОГРАММЫ
         self.title = 'Менеджер контактов организаций v1.0'
         
         icon_path = resource_path('ico/manager.ico')
@@ -142,6 +142,7 @@ class ContactManagerApp(App):
         return root
 
     def export_data(self, *args):
+        # Автоматическое сохранение на рабочий стол
         try:
             filepath = export_to_excel(self.db)
             InfoPopup("Успех", f"Данные успешно сохранены!\n\nФайл: {filepath}").open()
