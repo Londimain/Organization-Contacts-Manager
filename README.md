@@ -81,5 +81,6 @@ pyinstaller --onefile --windowed --clean --name ManagerContacts --icon="ico/mana
 ## 👨‍💻 Автор
 
 **Ильенков С.М.**
+
 Организация: ОАО "Компания МогНат"
 Год: 2026
