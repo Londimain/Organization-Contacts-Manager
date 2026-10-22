@@ -161,13 +161,21 @@ class ExcelRow(BoxLayout):
             self.col1_lines = [Line(width=1) for _ in range(len(col1_parts) - 1)]
         self.col1_box.bind(pos=self._upd_col1, size=self._upd_col1)
 
-        pad_left = level * 15 + 10
+        # Немного уменьшен отступ, чтобы "ФИО" не сжималось
+        pad_left = level * 10 + 10
+        
         for i, (text, weight) in enumerate(col1_parts):
             align = 'center' if is_header else 'left'
+            
+            # Отключаем сжатие (shorten) для слова "ФИО", чтобы оно не превращалось в "Ф..."
+            do_shorten = True
+            if len(col1_parts) > 1 and i == 0:
+                do_shorten = False
+
             lbl = Label(text=_make_text(text, highlight, markup=True),
                         size_hint_x=weight, halign=align, valign='middle',
                         color=C_TEXT, padding=(pad_left if not is_header and i == 0 else 10, 0),
-                        bold=is_header, font_size='14sp', shorten=True,
+                        bold=is_header, font_size='14sp', shorten=do_shorten,
                         shorten_from='right', markup=True)
             lbl.bind(size=lbl.setter('text_size'))
             self.col1_box.add_widget(lbl)
@@ -286,7 +294,7 @@ class ExcelRow(BoxLayout):
                 else:
                     app.select_row(self.node_type, self.db_id)
 
-            # Разворачивание — при клике в любом месте строки, если есть +/-
+            # Разворачивание — при клике в любом месте строки, если есть +/- (без Shift/Ctrl)
             if self.toggle_lbl.text in ('+', '-') and not ctrl_held and not shift_held:
                 if self._expand_event:
                     self._expand_event.cancel()

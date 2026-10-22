@@ -60,15 +60,15 @@ class ContactManagerApp(App):
         self.header_labels = {}
         self._skip_deselect = False
         
-        # --- Переменные для мультивыделения ---
         self.selected_keys = []
         self.anchor_index = None
         self.current_index = None
         self.shift_pressed = False
         self.ctrl_pressed = False
+        self._last_counts = {}
 
     def build(self):
-        self.title = 'Менеджер контактов организаций v1.1'
+        self.title = 'Менеджер контактов организаций v1.2'
         icon = resource_path('ico/manager.ico')
         if os.path.exists(icon):
             try:
@@ -88,6 +88,7 @@ class ContactManagerApp(App):
         self.expanded = set()
         self.selected_key = None
         self.current_rows = []
+        self._last_counts = self.db.get_counts()
 
         root = RootLayout(orientation='vertical', padding=10, spacing=8)
         with root.canvas.before:
@@ -96,7 +97,6 @@ class ContactManagerApp(App):
         root.bind(pos=lambda i, v: setattr(self.root_bg, 'pos', v),
                   size=lambda i, v: setattr(self.root_bg, 'size', v))
 
-        # Поиск + кнопки
         top = BoxLayout(size_hint_y=None, height=45, spacing=8)
         top.add_widget(Label(text='Поиск:', size_hint_x=None, width=60,
                              color=C_TEXT, bold=True))
@@ -105,6 +105,7 @@ class ContactManagerApp(App):
                                       padding=[10, 10, 10, 10])
         self.search_input.bind(text=self._on_search)
         top.add_widget(self.search_input)
+        
         top.add_widget(CustomButton(text='Корзина', size_hint_x=None, width=110,
                                     on_press=self.show_trash))
         top.add_widget(CustomButton(text='О программе', size_hint_x=None, width=140,
@@ -113,7 +114,6 @@ class ContactManagerApp(App):
                                     on_press=self.stop))
         root.add_widget(top)
 
-        # Шапка (без сортировки, по центру)
         header = BoxLayout(size_hint_y=None, height=35, spacing=0)
         with header.canvas.before:
             Color(*C_TABLE_HDR)
@@ -148,7 +148,6 @@ class ContactManagerApp(App):
         header.add_widget(make_hdr("№ телефона",           0.15))
         root.add_widget(header)
 
-        # Таблица
         self.scroll = ScrollView(do_scroll_x=False, bar_width=6, effect_cls='ScrollEffect')
         self.list_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=0)
         self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
@@ -156,7 +155,6 @@ class ContactManagerApp(App):
         self.scroll.bind(scroll_y=self._clamp_scroll_y) 
         root.add_widget(self.scroll)
 
-        # Панель действий 1
         row1 = BoxLayout(size_hint_y=None, height=46, spacing=8)
         self.add_btn = CustomButton(on_press=self.on_add)
         self.edit_btn = CustomButton(text='Редактировать', on_press=self.on_edit)
@@ -169,13 +167,11 @@ class ContactManagerApp(App):
             row1.add_widget(b)
         root.add_widget(row1)
 
-        # Панель действий 2
         row2 = BoxLayout(size_hint_y=None, height=40, spacing=8)
         row2.add_widget(CustomButton(text='Свернуть всё',
                                      on_press=lambda *_: self.collapse_all()))
         root.add_widget(row2)
 
-        # Статус-бар
         self.status_label = Label(text='', size_hint_y=None, height=24,
                                   color=C_TEXT_DIM, font_size='13sp',
                                   halign='left', valign='middle', padding=(10, 0))
@@ -190,7 +186,27 @@ class ContactManagerApp(App):
         Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
 
         self.refresh_view()
+        
+        # Автообновление раз в 2 секунды
+        Clock.schedule_interval(self._check_for_updates, 2.0)
+        
         return root
+
+    def _check_for_updates(self, dt):
+        if self._popup_open() or self._has_text_focus():
+            return
+            
+        try:
+            # Переподключаемся, чтобы получить свежие данные с сетевого диска
+            self.db.close()
+            self.db.connect()
+            
+            new_counts = self.db.get_counts()
+            if self._last_counts != new_counts:
+                self._last_counts = new_counts
+                self.refresh_view(keep_scroll=True, keep_selection=True)
+        except Exception as e:
+            log.error(f"Auto-update check failed: {e}")
 
     # ---------- Keyboard & Multi-selection ----------
     def _has_text_focus(self):
@@ -228,7 +244,6 @@ class ContactManagerApp(App):
             self.copy_selected_to_clipboard()
             return True
 
-        # Стрелки Вверх (273) и Вниз (274)
         if key in (273, 274):
             if self.current_index is not None and self.current_rows:
                 step = -1 if key == 273 else 1
@@ -247,11 +262,11 @@ class ContactManagerApp(App):
                         self._select_range(single=True)
             return True
 
-        if key == 13:   # Enter
+        if key == 13:
             self.on_edit(); return True
-        if key == 127:  # Delete
+        if key == 127:
             self.on_delete(); return True
-        if key == 277:  # Insert
+        if key == 277:
             self.on_add(); return True
         return False
 
@@ -356,7 +371,6 @@ class ContactManagerApp(App):
             if (row.node_type, row.db_id) in self.selected_keys and not row.is_header:
                 cells = []
                 
-                # 1 и 2 колонки: отдельно тип и отдельно имя
                 col1_children = row.col1_box.children
                 if len(col1_children) >= 2:
                     cells.append(col1_children[1].text)
@@ -368,18 +382,15 @@ class ContactManagerApp(App):
                     cells.append("")
                     cells.append("")
                 
-                # 3-6 колонки
                 for lbl in (row.lbl2, row.lbl3, row.lbl4, row.lbl5):
                     cells.append(lbl.text)
                     
                 clean_cells = []
                 for c in cells:
-                    # Очистка от разметки Kivy
                     clean = re.sub(r'\[.*?\]', '', str(c))
                     clean = clean.replace('&amp;', '&').replace('&bl;', '[').replace('&br;', ']')
                     clean = clean.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').strip()
                     
-                    # Добавляем невидимый пробел, чтобы Excel выровнял по левому краю
                     if clean and clean != '-':
                         clean = clean + "\u00A0"
                         
@@ -470,6 +481,7 @@ class ContactManagerApp(App):
             self.change_type_btn.disabled = True
 
     def refresh_view(self, keep_scroll=False, keep_selection=False):
+        self._last_counts = self.db.get_counts()
         scroll_y = self.scroll.scroll_y if keep_scroll else 1.0
         self.list_layout.clear_widgets()
         self.current_rows.clear()
