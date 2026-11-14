@@ -83,11 +83,11 @@ class ConfirmDialog(QDialog):
     def __init__(self, text, yes_text="Удалить"):
         super().__init__()
         self.setWindowTitle("Подтверждение")
-        self.resize(350, 120)
+        self.resize(450, 120)  # <--- УВЕЛИЧИЛИ ШИРИНУ с 350 до 450
         layout = QVBoxLayout(self)
         
         lbl = QLabel(text)
-        lbl.setWordWrap(True)
+        lbl.setWordWrap(False) # <--- ОТКЛЮЧИЛИ ПЕРЕНОС (или можно просто убрать эту строку)
         lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(lbl)
 

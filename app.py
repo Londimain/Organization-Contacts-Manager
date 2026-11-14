@@ -111,7 +111,23 @@ class LoadDataThread(QThread):
             self.finished_signal.emit(tree_data)
         except Exception as e:
             self.error_signal.emit(str(e))
-                     
+
+class ExportThread(QThread):
+    finished_signal = Signal(str) # Возвращает путь к сохраненному файлу
+    error_signal = Signal(str)
+
+    def __init__(self, db, filepath):
+        super().__init__()
+        self.db = db
+        self.filepath = filepath
+
+    def run(self):
+        try:
+            path = export_to_excel(self.db, filepath=self.filepath)
+            self.finished_signal.emit(path)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+                             
 class ImportThread(QThread):
     finished_signal = Signal(int, int, int)
     error_signal = Signal(str)
@@ -950,14 +966,43 @@ class MainWindow(QMainWindow):
                     self.update_status()
 
     def export_data(self):
-        export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
-        filepath = os.path.join(export_dir, 'contacts_export.xlsx')
-        try:
-            os.makedirs(export_dir, exist_ok=True)
-            export_to_excel(self.db, filepath=filepath)
-            InfoDialog("Успех", f"Данные сохранены:\n{filepath}").exec()
-        except Exception as e:
-            InfoDialog("Ошибка", f"Не удалось сохранить файл.\n\n{e}").exec()
+        # Сначала показываем окно подтверждения
+        dlg = ConfirmDialog("Вы уверены, что хотите экспортировать базу данных в Excel?", "Экспортировать")
+        
+        if dlg.exec():
+            export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
+            filepath = os.path.join(export_dir, 'contacts_export.xlsx')
+            
+            try:
+                os.makedirs(export_dir, exist_ok=True)
+                
+                # Показываем окно загрузки
+                self.loading_dlg = LoadingDialog("Экспорт данных в Excel...\nПожалуйста, подождите.")
+                self.loading_dlg.setWindowModality(Qt.ApplicationModal) 
+                self.loading_dlg.show()
+                
+                # Запускаем фоновый поток
+                self.export_thread = ExportThread(self.db, filepath)
+                self.export_thread.finished_signal.connect(self.on_export_finished)
+                self.export_thread.error_signal.connect(self.on_export_error)
+                self.export_thread.start()
+                
+            except Exception as e:
+                InfoDialog("Ошибка", f"Не удалось начать экспорт.\n\n{e}").exec()
+
+    def on_export_finished(self, filepath):
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Успех", f"Данные успешно сохранены:\n{filepath}").exec()
+
+    def on_export_error(self, error_msg):
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Ошибка экспорта", f"Не удалось сохранить файл:\n\n{error_msg}").exec()
 
     def import_data(self):
         filepath, _ = QFileDialog.getOpenFileName(self, "Импорт из Excel", "", "Excel Files (*.xlsx)")
