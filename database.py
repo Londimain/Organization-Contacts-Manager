@@ -570,3 +570,52 @@ class Database:
             return {'rp': rp, 'org': org, 'store': st, 'contact': ct}
         finally:
             conn.close()
+            
+    # ---------- Lookup for Import ----------
+    def find_rp_by_name(self, full_name):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM responsible_persons "
+                      "WHERE full_name=? AND deleted_at IS NULL", (full_name,))
+            return c.fetchone()
+        finally:
+            conn.close()
+
+    def find_org_by_name(self, rp_id, name):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM organizations "
+                      "WHERE rp_id=? AND name=? AND deleted_at IS NULL",
+                      (rp_id, name))
+            return c.fetchone()
+        finally:
+            conn.close()
+
+    def find_store_by_name(self, org_id, name):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM stores "
+                      "WHERE org_id=? AND name=? AND deleted_at IS NULL",
+                      (org_id, name))
+            return c.fetchone()
+        finally:
+            conn.close()
+
+    def find_contact_by_name(self, store_id, contact_type, full_name):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM contacts "
+                      "WHERE store_id=? AND contact_type=? AND full_name=? "
+                      "AND deleted_at IS NULL",
+                      (store_id, contact_type, full_name))
+            return c.fetchone()
+        finally:
+            conn.close()

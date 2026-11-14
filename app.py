@@ -4,28 +4,46 @@ import sys
 import re
 import logging
 from datetime import datetime
-from kivy.app import App
-from kivy.clock import Clock
-from kivy.core.clipboard import Clipboard
-from kivy.core.window import Window
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.textinput import TextInput
-from kivy.uix.popup import Popup
-from kivy.graphics import Color, Rectangle, Line
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                               QLineEdit, QLabel, QPushButton, QTreeView, QHeaderView,
+                               QMessageBox, QFileDialog, QApplication, QAbstractItemView,
+                               QStyledItemDelegate, QStyle, QStyleOptionViewItem, QSizePolicy)
+from PySide6.QtGui import (QStandardItemModel, QStandardItem, QAction, QShortcut, 
+                           QKeySequence, QIcon, QColor, QBrush, QFont, QPalette)
+from PySide6.QtCore import (Qt, QSortFilterProxyModel, QModelIndex, QEvent, 
+                            QTimer, QThread, Signal, QItemSelectionModel)
 
+from version import WINDOW_TITLE, REPO_URL
 from settings import DB_PATH, load_settings, save_settings, app_dir
 from database import Database
-from constants import *
-from widgets import CustomButton, RootLayout, ExcelRow
-from popups import (FormPopup, ConfirmPopup, ContactTypePopup, AboutPopup,
-                    InfoPopup, SaveFilePopup, TrashPopup,
-                    _validate_phone, _validate_date)
-from about import ABOUT_TEXT
-from export import export_to_excel, get_desktop_path
+from popups import (FormDialog, ConfirmDialog, ContactTypeDialog, AboutDialog,
+                    InfoDialog, TrashDialog, LoadingDialog, SettingsDialog)
+from export import export_to_excel, import_from_excel, get_desktop_path
 
 log = logging.getLogger('app')
+
+# ==============================================================================
+# ЦВЕТОВАЯ СХЕМА ИНТЕРФЕЙСА
+# ==============================================================================
+C_RP_TEXT      = "#6D015F"
+C_ORG_TEXT     = "#ffaa55"
+C_STORE_TEXT   = "#458a00"
+C_CONTACT_TEXT = "#aaaaaa"
+C_HEADER_TEXT  = "#55aaff"
+
+class KeepColorDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        
+        fg_brush = index.data(Qt.ForegroundRole)
+        if (opt.state & QStyle.State_Selected) and fg_brush:
+            if hasattr(fg_brush, 'color'):
+                opt.palette.setColor(QPalette.HighlightedText, fg_brush.color())
+            else:
+                opt.palette.setColor(QPalette.HighlightedText, fg_brush)
+        
+        super().paint(painter, opt, index)
 
 def resource_path(relative_path):
     try:
@@ -34,856 +52,1002 @@ def resource_path(relative_path):
         base = os.path.abspath(".")
     return os.path.join(base, relative_path)
 
-
 def _phone_validator(phone):
-    if _validate_phone(phone):
-        return True, ''
-    return False, 'Телефон должен содержать хотя бы одну цифру'
-
+    if not phone: return True, ''
+    if not any(ch.isdigit() for ch in phone):
+        return False, 'Должна быть хотя бы одна цифра'
+    return True, ''
 
 def _date_validator(date):
-    if _validate_date(date):
-        return True, ''
-    return False, 'Формат: ДД.ММ.ГГГГ или ГГГГ-ММ-ДД'
+    if not date: return True, ''
+    for fmt in ('%d.%m.%Y', '%Y-%m-%d', '%d/%m/%Y'):
+        try:
+            datetime.strptime(date, fmt)
+            return True, ''
+        except ValueError:
+            continue
+    return False, 'Формат: ДД.ММ.ГГГГ'
 
+class SwitchDbThread(QThread):
+    finished_signal = Signal(object)
+    error_signal = Signal(str)
 
-class ContactManagerApp(App):
-    db = None
-    selected_node = None
+    def __init__(self, new_path):
+        super().__init__()
+        self.new_path = new_path
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.settings = load_settings()
-        self.sort_key = 'name'
-        self.sort_dir = 'ASC'
-        self.status_label = None
-        self.header_labels = {}
-        self._skip_deselect = False
+    def run(self):
+        try:
+            new_db = Database(self.new_path)
+            new_db.connect() 
+            self.finished_signal.emit(new_db)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+class LoadDataThread(QThread):
+    finished_signal = Signal(object) # object для безопасной передачи списка
+    error_signal = Signal(str)
+
+    def __init__(self, db):
+        super().__init__()
+        self.db = db
+
+    def run(self):
+        try:
+            tree_data = []
+            for rp in self.db.get_responsible_persons():
+                rp_node = {'rp': rp, 'orgs': []}
+                for org in self.db.get_organizations(rp['id']):
+                    org_node = {'org': org, 'stores': []}
+                    for st in self.db.get_stores(org['id']):
+                        st_node = {
+                            'store': st,
+                            'dm': self.db.get_contacts(st['id'], 'decision_maker'),
+                            'pay': self.db.get_contacts(st['id'], 'payment')
+                        }
+                        org_node['stores'].append(st_node)
+                    rp_node['orgs'].append(org_node)
+                tree_data.append(rp_node)
+            self.finished_signal.emit(tree_data)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+                     
+class ImportThread(QThread):
+    finished_signal = Signal(int, int, int)
+    error_signal = Signal(str)
+
+    def __init__(self, db, filepath):
+        super().__init__()
+        self.db = db
+        self.filepath = filepath
+
+    def run(self):
+        try:
+            added, updated, skipped = import_from_excel(self.db, self.filepath)
+            self.finished_signal.emit(added, updated, skipped)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(WINDOW_TITLE)
+        self.resize(1400, 900)
         
-        self.selected_keys = []
-        self.anchor_index = None
-        self.current_index = None
-        self.shift_pressed = False
-        self.ctrl_pressed = False
-        self._last_counts = {}
-
-    def build(self):
-        self.title = 'Менеджер контактов организаций v1.2'
-        icon = resource_path('ico/manager.ico')
-        if os.path.exists(icon):
-            try:
-                self.icon = icon
-                Window.set_icon(icon)
-            except Exception as e:
-                log.warning(f"Set icon failed: {e}")
-
-        if self.settings.get('maximized', True):
-            Window.maximize()
-        else:
-            Window.size = tuple(self.settings.get('window_size', (1400, 900)))
+        self.is_searching = False
+        self.saved_expanded_nodes = set()
+        
+        icon_path = resource_path('ico/manager.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         self.db = Database(DB_PATH)
         self.db.connect()
 
-        self.expanded = set()
-        self.selected_key = None
-        self.current_rows = []
-        self._last_counts = self.db.get_counts()
-
-        root = RootLayout(orientation='vertical', padding=10, spacing=8)
-        with root.canvas.before:
-            Color(*C_BG)
-            self.root_bg = Rectangle(pos=root.pos, size=root.size)
-        root.bind(pos=lambda i, v: setattr(self.root_bg, 'pos', v),
-                  size=lambda i, v: setattr(self.root_bg, 'size', v))
-
-        top = BoxLayout(size_hint_y=None, height=45, spacing=8)
-        top.add_widget(Label(text='Поиск:', size_hint_x=None, width=60,
-                             color=C_TEXT, bold=True))
-        self.search_input = TextInput(hint_text='Поиск по всей базе... (Ctrl+F)',
-                                      multiline=False, font_size=16,
-                                      padding=[10, 10, 10, 10])
-        self.search_input.bind(text=self._on_search)
-        top.add_widget(self.search_input)
-        
-        top.add_widget(CustomButton(text='Корзина', size_hint_x=None, width=110,
-                                    on_press=self.show_trash))
-        top.add_widget(CustomButton(text='О программе', size_hint_x=None, width=140,
-                                    on_press=self.show_about))
-        top.add_widget(CustomButton(text='Выход', size_hint_x=None, width=90,
-                                    on_press=self.stop))
-        root.add_widget(top)
-
-        header = BoxLayout(size_hint_y=None, height=35, spacing=0)
-        with header.canvas.before:
-            Color(*C_TABLE_HDR)
-            self.hdr_bg = Rectangle(pos=header.pos, size=header.size)
-            Color(*C_RED_LINE)
-            self.hdr_lines = [Line(width=1.2) for _ in range(6)]
-
-        def upd_hdr(inst, val):
-            self.hdr_bg.pos = inst.pos
-            self.hdr_bg.size = inst.size
-            self.hdr_lines[0].rectangle = (inst.x + 1, inst.y, inst.width - 2, inst.height)
-            self.hdr_lines[1].points = [inst.x + 1, inst.y, inst.x + 1, inst.top]
-            aw = inst.width - 30
-            x0 = inst.x + 30
-            xs = [x0, x0 + aw * 0.35, x0 + aw * 0.50, x0 + aw * 0.60, x0 + aw * 0.85]
-            for i, x in enumerate(xs[1:], start=2):
-                self.hdr_lines[i].points = [x, inst.y, x, inst.top]
-        header.bind(pos=upd_hdr, size=upd_hdr)
-
-        header.add_widget(Label(text="", size_hint_x=None, width=30))
-
-        def make_hdr(text, hint_x):
-            lbl = Label(text=text, size_hint_x=hint_x, halign='center', valign='middle',
-                        bold=True, padding=(5, 0), font_size='15sp', color=C_TEXT)
-            lbl.bind(size=lbl.setter('text_size'))
-            return lbl
-
-        header.add_widget(make_hdr("Наименование / ФИО",   0.35))
-        header.add_widget(make_hdr("Город / Договор",      0.15))
-        header.add_widget(make_hdr("Дата договора",        0.10))
-        header.add_widget(make_hdr("Адрес / Должность",    0.25))
-        header.add_widget(make_hdr("№ телефона",           0.15))
-        root.add_widget(header)
-
-        self.scroll = ScrollView(do_scroll_x=False, bar_width=6, effect_cls='ScrollEffect')
-        self.list_layout = BoxLayout(orientation='vertical', size_hint_y=None, spacing=0)
-        self.list_layout.bind(minimum_height=self.list_layout.setter('height'))
-        self.scroll.add_widget(self.list_layout)
-        self.scroll.bind(scroll_y=self._clamp_scroll_y) 
-        root.add_widget(self.scroll)
-
-        row1 = BoxLayout(size_hint_y=None, height=46, spacing=8)
-        self.add_btn = CustomButton(on_press=self.on_add)
-        self.edit_btn = CustomButton(text='Редактировать', on_press=self.on_edit)
-        self.delete_btn = CustomButton(text='Удалить', on_press=self.on_delete)
-        self.change_type_btn = CustomButton(text='Сменить тип', on_press=self.on_change_contact_type)
-        self.export_btn = CustomButton(text='Экспорт в Excel', on_press=self.export_data)
-        
-        for b in (self.add_btn, self.edit_btn, self.delete_btn,
-                  self.change_type_btn, self.export_btn):
-            row1.add_widget(b)
-        root.add_widget(row1)
-
-        row2 = BoxLayout(size_hint_y=None, height=40, spacing=8)
-        row2.add_widget(CustomButton(text='Свернуть всё',
-                                     on_press=lambda *_: self.collapse_all()))
-        root.add_widget(row2)
-
-        self.status_label = Label(text='', size_hint_y=None, height=24,
-                                  color=C_TEXT_DIM, font_size='13sp',
-                                  halign='left', valign='middle', padding=(10, 0))
-        self.status_label.bind(size=self.status_label.setter('text_size'))
-        with self.status_label.canvas.before:
-            Color(*C_STATUS_BG)
-            self.status_bg = Rectangle(pos=self.status_label.pos, size=self.status_label.size)
-        self.status_label.bind(pos=lambda i, v: setattr(self.status_bg, 'pos', v),
-                               size=lambda i, v: setattr(self.status_bg, 'size', v))
-        root.add_widget(self.status_label)
-
-        Window.bind(on_key_down=self._on_key_down, on_key_up=self._on_key_up)
-
+        self.setup_ui()
         self.refresh_view()
+        self.setup_shortcuts()
         
-        # Автообновление раз в 2 секунды
-        Clock.schedule_interval(self._check_for_updates, 2.0)
+        # --- НОВОЕ: Таймер для проверки обновлений с других ПК ---
+        self.last_db_mtime = self._get_db_mtime()
+        self.auto_refresh_timer = QTimer(self)
+        self.auto_refresh_timer.timeout.connect(self.check_for_external_changes)
+        self.auto_refresh_timer.start(10000) # Проверка каждые 10 секунд (10 000 мс)
+
+    def setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        # --- Верхняя панель ---
+        top_layout = QHBoxLayout()
         
-        return root
+        lbl_search = QLabel("Поиск:")
+        lbl_search.setStyleSheet("font-size: 16px;")
+        top_layout.addWidget(lbl_search)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Поиск по всей базе... (Ctrl+F)")
+        self.search_input.setStyleSheet("font-size: 16px; padding: 4px;")
+        self.search_input.textChanged.connect(self.on_search)
+        top_layout.addWidget(self.search_input)
 
-    def _check_for_updates(self, dt):
-        if self._popup_open() or self._has_text_focus():
-            return
-            
-        try:
-            # Переподключаемся, чтобы получить свежие данные с сетевого диска
-            self.db.close()
-            self.db.connect()
-            
-            new_counts = self.db.get_counts()
-            if self._last_counts != new_counts:
-                self._last_counts = new_counts
-                self.refresh_view(keep_scroll=True, keep_selection=True)
-        except Exception as e:
-            log.error(f"Auto-update check failed: {e}")
+        btn_settings = QPushButton("Настройки")
+        btn_settings.clicked.connect(self.show_settings)
 
-    # ---------- Keyboard & Multi-selection ----------
-    def _has_text_focus(self):
-        if self.root:
-            for w in self.root.walk():
-                if isinstance(w, TextInput) and w.focus:
+        btn_trash = QPushButton("Корзина")
+        btn_trash.clicked.connect(self.show_trash)
+        btn_about = QPushButton("О программе")
+        btn_about.clicked.connect(self.show_about)
+        btn_exit = QPushButton("Выход")
+        btn_exit.clicked.connect(self.close)
+
+        for b in (btn_settings, btn_trash, btn_about, btn_exit): 
+            b.setFixedWidth(120)
+            top_layout.addWidget(b)
+
+        layout.addLayout(top_layout)
+
+        # --- Таблица (Дерево) ---
+        self.tree = QTreeView()
+        self.model = QStandardItemModel()
+        
+        self.tree.setItemDelegate(KeepColorDelegate(self.tree))
+        
+        self.model.setHorizontalHeaderLabels([
+            "Тип", "Наименование / ФИО", "Город / Договор", "Дата договора", "Адрес / Должность", "№ телефона"
+        ])
+        
+        for i in range(self.model.columnCount()):
+            self.model.setHeaderData(i, Qt.Horizontal, Qt.AlignCenter, Qt.TextAlignmentRole)
+        
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.proxy_model.setRecursiveFilteringEnabled(True)
+        self.proxy_model.setFilterKeyColumn(-1)
+
+        self.tree.setModel(self.proxy_model)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setSortingEnabled(True)
+        self.tree.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tree.setMouseTracking(True)
+        self.tree.setExpandsOnDoubleClick(False)
+        self.tree.setTextElideMode(Qt.ElideNone)
+        self.tree.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        
+        self.tree.clicked.connect(self.on_tree_clicked)
+        self.tree.doubleClicked.connect(self.copy_cell_text)
+        self.tree.viewport().installEventFilter(self)
+
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+
+        self.tree.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        layout.addWidget(self.tree)
+
+        # --- Панель с кнопками действий ---
+        btn_layout = QHBoxLayout()
+        self.btn_add = QPushButton("Добавить")
+        self.btn_edit = QPushButton("Редактировать")
+        self.btn_delete = QPushButton("Удалить")
+        self.btn_change_type = QPushButton("Сменить тип")
+        self.btn_export = QPushButton("Экспорт в Excel")
+        self.btn_import = QPushButton("Импорт из Excel")
+
+        self.btn_add.clicked.connect(self.on_add)
+        self.btn_edit.clicked.connect(self.on_edit)
+        self.btn_delete.clicked.connect(self.on_delete)
+        self.btn_change_type.clicked.connect(self.on_change_type)
+        self.btn_export.clicked.connect(self.export_data)
+        self.btn_import.clicked.connect(self.import_data)
+
+        for b in (self.btn_add, self.btn_edit, self.btn_delete,
+                  self.btn_change_type, self.btn_export, self.btn_import):
+            btn_layout.addWidget(b)
+        layout.addLayout(btn_layout)
+
+        # --- Нижняя панель ---
+        bottom_layout = QHBoxLayout()
+        
+        btn_collapse = QPushButton("Свернуть всё")
+        btn_collapse.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        btn_collapse.clicked.connect(self.collapse_all)
+        # Коэффициент 5 делает кнопку очень широкой
+        bottom_layout.addWidget(btn_collapse, 5)
+
+        self.status_label = QLabel("")
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        bottom_layout.addWidget(self.status_label, 3)
+
+        self.db_status_label = QLabel("")
+        self.db_status_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.db_status_label.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        bottom_layout.addWidget(self.db_status_label)
+        
+        layout.addLayout(bottom_layout)
+
+    def eventFilter(self, source, event):
+        if source is self.tree.viewport():
+            if event.type() in (QEvent.MouseButtonPress, QEvent.ContextMenu):
+                if event.type() == QEvent.ContextMenu or event.button() == Qt.RightButton:
+                    self.tree.clearSelection()
+                    self.tree.setCurrentIndex(QModelIndex())
                     return True
-        for w in Window.children:
-            if isinstance(w, Popup):
-                for sub in w.walk():
-                    if isinstance(sub, TextInput) and sub.focus:
+                
+                elif event.button() == Qt.LeftButton:
+                    index = self.tree.indexAt(event.pos())
+                    if not index.isValid():
+                        self.tree.clearSelection()
+                        self.tree.setCurrentIndex(QModelIndex())
                         return True
-        return False
-
-    def _popup_open(self):
-        for w in Window.children:
-            if isinstance(w, Popup):
-                return True
-        return False
-
-    def _on_key_down(self, window, key, scancode, codepoint, modifiers):
-        if key in (304, 303) or 'shift' in modifiers:
-            self.shift_pressed = True
-        if key in (308, 306) or 'ctrl' in modifiers:
-            self.ctrl_pressed = True
-
-        if 'ctrl' in modifiers and key == 102:  # Ctrl+F
-            self.search_input.focus = True
-            return True
-            
-        if self._has_text_focus() or self._popup_open():
-            return False
-
-        if 'ctrl' in modifiers and key == 99:  # Ctrl+C (Копировать)
-            self.copy_selected_to_clipboard()
-            return True
-
-        if key in (273, 274):
-            if self.current_index is not None and self.current_rows:
-                step = -1 if key == 273 else 1
-                new_index = self.current_index + step
-                
-                while 0 <= new_index < len(self.current_rows) and self.current_rows[new_index].is_header:
-                    new_index += step
-                
-                if 0 <= new_index < len(self.current_rows):
-                    self.current_index = new_index
-                    
-                    if 'shift' in modifiers or self.shift_pressed:
-                        self._select_range(single=False)
-                    else:
-                        self.anchor_index = self.current_index
-                        self._select_range(single=True)
-            return True
-
-        if key == 13:
-            self.on_edit(); return True
-        if key == 127:
-            self.on_delete(); return True
-        if key == 277:
-            self.on_add(); return True
-        return False
-
-    def _on_key_up(self, window, key, *args):
-        if key in (304, 303):
-            self.shift_pressed = False
-        if key in (308, 306):
-            self.ctrl_pressed = False
-        return False
-
-    def handle_shift_click(self, row):
-        clicked_index = -1
-        for i, r in enumerate(self.current_rows):
-            if r == row:
-                clicked_index = i
-                break
-                
-        if clicked_index != -1:
-            self.current_index = clicked_index
-            if self.anchor_index is None:
-                self.anchor_index = clicked_index
-            self._select_range(single=False)
-
-    def handle_ctrl_click(self, row):
-        if row.is_header:
-            return
-            
-        key = (row.node_type, row.db_id)
-        
-        if key in self.selected_keys:
-            self.selected_keys.remove(key)
-            row.set_selected(False)
-        else:
-            self.selected_keys.append(key)
-            row.set_selected(True)
-            
-        for i, r in enumerate(self.current_rows):
-            if r == row:
-                self.current_index = i
-                self.anchor_index = i
-                break
-                
-        if len(self.selected_keys) == 1:
-            n_type, n_id = self.selected_keys[0]
-            self.selected_node = type('N', (), {'node_type': n_type, 'db_id': n_id})()
-        else:
-            self.selected_node = None
-            
-        self.update_buttons()
-
-    def _select_range(self, single=False):
-        if self.anchor_index is None or self.current_index is None:
-            return
-        
-        if single:
-            start, end = self.current_index, self.current_index
-        else:
-            start = min(self.anchor_index, self.current_index)
-            end = max(self.anchor_index, self.current_index)
-            
-        self.selected_keys = []
-        for i in range(start, end + 1):
-            row = self.current_rows[i]
-            if not row.is_header:
-                self.selected_keys.append((row.node_type, row.db_id))
-                
-        for i, row in enumerate(self.current_rows):
-            if row.is_header:
-                row.set_selected(False)
-            else:
-                row.set_selected(start <= i <= end)
-                
-        if len(self.selected_keys) == 1:
-            n_type, n_id = self.selected_keys[0]
-            self.selected_node = type('N', (), {'node_type': n_type, 'db_id': n_id})()
-        else:
-            self.selected_node = None
-            
-        self.update_buttons()
-        
-        if self.current_index < len(self.current_rows):
-            target_row = self.current_rows[self.current_index]
-            
-            if hasattr(self, '_scroll_event') and self._scroll_event:
-                self._scroll_event.cancel()
-                
-            def safe_scroll(dt):
-                row_y, row_top = target_row.to_window(0, target_row.y)[1], target_row.to_window(0, target_row.top)[1]
-                view_y, view_top = self.scroll.to_window(0, self.scroll.y)[1], self.scroll.to_window(0, self.scroll.top)[1]
-                
-                if row_y < view_y or row_top > view_top:
-                    self.scroll.scroll_to(target_row, padding=0, animate=False)
-                    
-            self._scroll_event = Clock.schedule_once(safe_scroll, 0.02)
-
-    def copy_selected_to_clipboard(self):
-        if not self.selected_keys:
-            return
-        
-        lines = []
-        for row in self.current_rows:
-            if (row.node_type, row.db_id) in self.selected_keys and not row.is_header:
-                cells = []
-                
-                col1_children = row.col1_box.children
-                if len(col1_children) >= 2:
-                    cells.append(col1_children[1].text)
-                    cells.append(col1_children[0].text)
-                elif len(col1_children) == 1:
-                    cells.append("")
-                    cells.append(col1_children[0].text)
-                else:
-                    cells.append("")
-                    cells.append("")
-                
-                for lbl in (row.lbl2, row.lbl3, row.lbl4, row.lbl5):
-                    cells.append(lbl.text)
-                    
-                clean_cells = []
-                for c in cells:
-                    clean = re.sub(r'\[.*?\]', '', str(c))
-                    clean = clean.replace('&amp;', '&').replace('&bl;', '[').replace('&br;', ']')
-                    clean = clean.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ').strip()
-                    
-                    if clean and clean != '-':
-                        clean = clean + "\u00A0"
                         
-                    clean_cells.append(clean)
-                    
-                lines.append("\t".join(clean_cells))
-        
-        if lines:
-            Clipboard.copy("\r\n".join(lines))
+        return super().eventFilter(source, event)
 
-    def deselect_all(self):
-        self.selected_node = None
-        self.selected_key = None
-        self.selected_keys = []
-        self.anchor_index = None
-        self.current_index = None
-        
-        for row in self.current_rows:
-            row.set_selected(False)
-            for child in row.walk():
-                if isinstance(child, Label) and hasattr(child, '_orig_color'):
-                    child.color = child._orig_color
-        self.update_buttons()
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(10, self.force_stretch_columns)
 
-    def select_row(self, node_type, db_id):
-        self.selected_key = (node_type, db_id)
-        self.selected_keys = [(node_type, db_id)]
-        self.selected_node = type('N', (), {'node_type': node_type, 'db_id': db_id})()
+    def force_stretch_columns(self):
+        if self.model.columnCount() == 0: return
         
-        for i, row in enumerate(self.current_rows):
-            if row.node_type == node_type and row.db_id == db_id:
-                self.anchor_index = i
-                self.current_index = i
-                row.set_selected(True)
-            else:
-                row.set_selected(False)
-                
-        self.update_buttons()
-
-    def toggle_expand(self, node_type, db_id):
-        key = (node_type, db_id)
-        if key in self.expanded:
-            self.expanded.remove(key)
+        header = self.tree.header()
+        for i in range(self.model.columnCount()):
+            header.setSectionResizeMode(i, QHeaderView.Interactive)
+            
+        self.tree.resizeColumnToContents(0)
+        self.tree.resizeColumnToContents(2)
+        self.tree.resizeColumnToContents(3)
+        self.tree.resizeColumnToContents(5)
+        
+        fm = self.tree.fontMetrics()
+        max_text_w = max(fm.horizontalAdvance("Ответственный"), fm.horizontalAdvance("Организация"))
+        min_w0 = max_text_w + (self.tree.indentation() * 3) + 20
+        
+        w0 = self.tree.columnWidth(0)
+        if w0 < min_w0:
+            w0 = min_w0
+            self.tree.setColumnWidth(0, w0)
+            
+        w2 = self.tree.columnWidth(2)
+        w3 = self.tree.columnWidth(3)
+        w5 = self.tree.columnWidth(5)
+        
+        viewport_width = self.tree.viewport().width() - 20
+        remaining = viewport_width - w0 - w2 - w3 - w5
+        
+        if remaining > 200:
+            w1 = int(remaining * 0.55)
+            w4 = remaining - w1 
+            self.tree.setColumnWidth(1, w1)
+            self.tree.setColumnWidth(4, w4)
         else:
-            self.expanded.add(key)
+            self.tree.setColumnWidth(1, 250)
+            self.tree.setColumnWidth(4, 150)
+
+    def on_tree_clicked(self, proxy_index):
+        if not proxy_index.isValid(): return
+            
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers in (Qt.ControlModifier, Qt.ShiftModifier): 
+            return
+            
+        idx0 = self.proxy_model.index(proxy_index.row(), 0, proxy_index.parent())
         
-        self.refresh_view(keep_scroll=True, keep_selection=True)
+        if self.proxy_model.rowCount(idx0) > 0:
+            self.tree.setExpanded(idx0, not self.tree.isExpanded(idx0))
+
+    def flash_item(self, item):
+        if not item: return
+        orig_fg = item.data(Qt.ForegroundRole)
+        item.setForeground(QBrush(QColor("#00FF00"))) 
         
-        for i, row in enumerate(self.current_rows):
-            if (row.node_type, row.db_id) == (node_type, db_id):
-                self.anchor_index = i
-                self.current_index = i
-                break
-        self.update_buttons()
+        def restore():
+            if item:
+                item.setData(orig_fg, Qt.ForegroundRole)
+                
+        QTimer.singleShot(200, restore)
+
+    def copy_cell_text(self, proxy_index):
+        if not proxy_index.isValid(): return
+        text = self.proxy_model.data(proxy_index)
+        if text and text.strip() not in ('-', ''):
+            QApplication.clipboard().setText(text)
+            self.status_label.setText(f"Скопировано: {text[:30]}...")
+            QTimer.singleShot(3000, self.update_status)
+            
+            src_idx = self.proxy_model.mapToSource(proxy_index)
+            item = self.model.itemFromIndex(src_idx)
+            self.flash_item(item)
+
+    def setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.search_input.setFocus)
+        QShortcut(QKeySequence("Insert"), self).activated.connect(self.on_add)
+        QShortcut(QKeySequence("Delete"), self).activated.connect(self.on_delete)
+        QShortcut(QKeySequence("Enter"), self).activated.connect(self.on_edit)
+        QShortcut(QKeySequence("Ctrl+C"), self).activated.connect(self.copy_selected)
+
+    def get_expanded_nodes(self):
+        expanded = set()
+        def traverse(parent_index):
+            for row in range(self.proxy_model.rowCount(parent_index)):
+                index = self.proxy_model.index(row, 0, parent_index)
+                if self.tree.isExpanded(index):
+                    src_index = self.proxy_model.mapToSource(index)
+                    item = self.model.itemFromIndex(src_index)
+                    data = item.data(Qt.UserRole)
+                    if data and data[0] != 'header':
+                        expanded.add(data)
+                traverse(index)
+        traverse(QModelIndex())
+        return expanded
+
+    def restore_expanded_nodes(self):
+        def traverse(parent_index):
+            for row in range(self.proxy_model.rowCount(parent_index)):
+                index = self.proxy_model.index(row, 0, parent_index)
+                src_index = self.proxy_model.mapToSource(index)
+                item = self.model.itemFromIndex(src_index)
+                data = item.data(Qt.UserRole)
+                if data in self.saved_expanded_nodes:
+                    self.tree.expand(index)
+                traverse(index)
+        traverse(QModelIndex())
+
+    def find_index_by_data(self, data_key):
+        def traverse(parent_index):
+            for row in range(self.proxy_model.rowCount(parent_index)):
+                index = self.proxy_model.index(row, 0, parent_index)
+                src_index = self.proxy_model.mapToSource(index)
+                item = self.model.itemFromIndex(src_index)
+                data = item.data(Qt.UserRole)
+                if data == data_key:
+                    return index
+                res = traverse(index)
+                if res: return res
+            return None
+        return traverse(QModelIndex())
+
+    def _get_item_by_key(self, data_key):
+        proxy_idx = self.find_index_by_data(data_key)
+        if proxy_idx and proxy_idx.isValid():
+            src_idx = self.proxy_model.mapToSource(proxy_idx)
+            return self.model.itemFromIndex(src_idx)
+        return None
+
+    def _select_item(self, data_key):
+        proxy_idx = self.find_index_by_data(data_key)
+        if proxy_idx and proxy_idx.isValid():
+            parent = proxy_idx.parent()
+            while parent.isValid():
+                self.tree.expand(parent)
+                parent = parent.parent()
+            self.tree.setCurrentIndex(proxy_idx)
+            self.tree.selectionModel().select(proxy_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+            self.tree.scrollTo(proxy_idx)
+            
+            src_idx = self.proxy_model.mapToSource(proxy_idx)
+            item = self.model.itemFromIndex(src_idx)
+            self.flash_item(item)
+
+    def _get_db_mtime(self):
+        """Возвращает время последнего изменения файла базы данных."""
+        try:
+            return os.path.getmtime(self.db.db_name)
+        except Exception:
+            return 0
+
+    def check_for_external_changes(self):
+        """Проверяет, не изменил ли кто-то базу данных на сервере."""
+        # Не обновляем, если открыто какое-то диалоговое окно (пользователь что-то вводит)
+        if QApplication.activeModalWidget():
+            return
+
+        current_mtime = self._get_db_mtime()
+        if current_mtime > self.last_db_mtime:
+            # База изменилась! Обновляем тихо, без окна загрузки
+            self.last_db_mtime = current_mtime
+            self.refresh_view(silent=True)
+                   
+    def refresh_view(self, select_data=None, show_cursor=True, silent=False):
+        self._pending_select_data = select_data
+        
+        # Показываем окно загрузки ТОЛЬКО если это не тихое автообновление
+        if not silent:
+            if not hasattr(self, 'loading_dlg') or not self.loading_dlg:
+                self.loading_dlg = LoadingDialog("Загрузка данных из базы...\nПожалуйста, подождите.")
+                self.loading_dlg.setWindowModality(Qt.ApplicationModal) 
+                self.loading_dlg.show()
+
+        # Сохраняем текущее состояние (открытые узлы, выделение)
+        self.saved_expanded_nodes = self.get_expanded_nodes()
+        self._pending_old_sel = self.get_selected_data()
+
+        # Запускаем фоновый поток
+        self.load_thread = LoadDataThread(self.db)
+        self.load_thread.finished_signal.connect(self.on_data_loaded)
+        self.load_thread.error_signal.connect(self.on_data_load_error)
+        self.load_thread.start()
+
+    def on_data_loaded(self, tree_data):
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.model.clear()
+            self.model.setHorizontalHeaderLabels([
+                "Тип", "Наименование / ФИО", "Город / Договор", "Дата договора", "Адрес / Должность", "№ телефона"
+            ])
+            for i in range(self.model.columnCount()):
+                self.model.setHeaderData(i, Qt.Horizontal, Qt.AlignCenter, Qt.TextAlignmentRole)
+
+            font_hdr = QFont()
+            font_hdr.setBold(True)
+
+            for rp_node in tree_data:
+                rp = rp_node['rp']
+                rp_row = self.make_row(
+                    "Ответственный", rp['full_name'], rp['city'] or '-', '', 
+                    rp['position'] or '-', rp['phone'] or '-', ('rp', rp['id'])
+                )
+                self.model.invisibleRootItem().appendRow(rp_row)
+                
+                for org_node in rp_node['orgs']:
+                    org = org_node['org']
+                    org_row = self.make_row(
+                        "Организация", org['name'], org['contract_number'] or '-',
+                        org['contract_date'] or '-', org['address'] or '-', org['phone'] or '-',
+                        ('org', org['id'])
+                    )
+                    rp_row[0].appendRow(org_row)
+                    
+                    for st_node in org_node['stores']:
+                        st = st_node['store']
+                        st_row = self.make_row(
+                            "Магазин", st['name'], '', '', st['unloading_address'] or '-', st['phone'] or '-',
+                            ('store', st['id'])
+                        )
+                        org_row[0].appendRow(st_row)
+                        
+                        hdr_dm_type = QStandardItem("")
+                        hdr_dm_type.setData(('header', 'decision_maker', st['id']), Qt.UserRole)
+                        hdr_dm_name = QStandardItem("Контакты ЛПР")
+                        hdr_dm_name.setFont(font_hdr)
+                        hdr_dm_name.setForeground(QBrush(QColor(C_HEADER_TEXT)))
+                        row_dm = [hdr_dm_type, hdr_dm_name, QStandardItem(""), QStandardItem(""), QStandardItem(""), QStandardItem("")]
+                        st_row[0].appendRow(row_dm)
+                        
+                        for c in st_node['dm']:
+                            dm_row = self.make_row("", c['full_name'] or '-', '', '', c['position'] or '-', c['phone'] or '-', ('contact_dm', c['id']))
+                            hdr_dm_type.appendRow(dm_row) 
+                            
+                        hdr_pay_type = QStandardItem("")
+                        hdr_pay_type.setData(('header', 'payment', st['id']), Qt.UserRole)
+                        hdr_pay_name = QStandardItem("Контакты оплаты")
+                        hdr_pay_name.setFont(font_hdr)
+                        hdr_pay_name.setForeground(QBrush(QColor(C_HEADER_TEXT)))
+                        row_pay = [hdr_pay_type, hdr_pay_name, QStandardItem(""), QStandardItem(""), QStandardItem(""), QStandardItem("")]
+                        st_row[0].appendRow(row_pay)
+                        
+                        for c in st_node['pay']:
+                            pay_row = self.make_row("", c['full_name'] or '-', '', '', c['position'] or '-', c['phone'] or '-', ('contact_pay', c['id']))
+                            hdr_pay_type.appendRow(pay_row)
+
+            self.force_stretch_columns()
+            self.restore_expanded_nodes()
+            self.saved_expanded_nodes.clear()
+            
+            target = self._pending_select_data if self._pending_select_data else self._pending_old_sel
+            if target:
+                new_idx = self.find_index_by_data(target)
+                if new_idx and new_idx.isValid():
+                    parent = new_idx.parent()
+                    while parent.isValid():
+                        self.tree.expand(parent)
+                        parent = parent.parent()
+                    self.tree.setCurrentIndex(new_idx)
+                    self.tree.selectionModel().select(new_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows)
+                    self.tree.scrollTo(new_idx)
+                    
+        finally:
+            self.tree.setUpdatesEnabled(True)
+            QTimer.singleShot(50, self.force_stretch_columns) 
+            self.update_status()
+            
+            # Обновляем время последнего изменения, чтобы таймер не срабатывал зря
+            self.last_db_mtime = self._get_db_mtime()
+            
+            if hasattr(self, 'loading_dlg') and self.loading_dlg:
+                self.loading_dlg.accept()
+                self.loading_dlg = None
+
+    def on_data_load_error(self, error_msg):
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+        InfoDialog("Ошибка", f"Не удалось загрузить данные из базы:\n{error_msg}").exec()
+
+    def make_row(self, type_name, name, c2, c3, c4, c5, data_key):
+        item_type = QStandardItem(type_name)
+        item_name = QStandardItem(name)
+        
+        brush = QBrush()
+        font = QFont()
+        
+        if data_key[0] == 'rp':
+            brush.setColor(QColor(C_RP_TEXT))
+            font.setBold(True)
+            item_type.setFont(font)
+        elif data_key[0] == 'org':
+            brush.setColor(QColor(C_ORG_TEXT))
+            font.setBold(True)
+            item_type.setFont(font)
+        elif data_key[0] == 'store':
+            brush.setColor(QColor(C_STORE_TEXT))
+        elif data_key[0] in ('contact_dm', 'contact_pay'):
+            brush.setColor(QColor(C_CONTACT_TEXT))
+            
+        if brush.color().isValid():
+            item_type.setForeground(brush)
+        
+        items = [
+            item_type,
+            item_name,
+            QStandardItem(c2),
+            QStandardItem(c3),
+            QStandardItem(c4),
+            QStandardItem(c5)
+        ]
+        items[0].setData(data_key, Qt.UserRole)
+        
+        return items
 
     def collapse_all(self):
-        self.expanded.clear()
-        self.refresh_view()
+        self.tree.collapseAll()
 
-    def update_buttons(self):
-        n = self.selected_node
-        count = len(self.selected_keys)
-        has = count > 0
-        
-        if count == 0:
-            self.add_btn.text = 'Добавить ответственного'
-            self.add_btn.disabled = False
-        elif count == 1:
-            if n and n.node_type == 'rp':
-                self.add_btn.text = 'Добавить организацию'
-            elif n and n.node_type == 'org':
-                self.add_btn.text = 'Добавить магазин'
-            elif n and n.node_type == 'store':
-                self.add_btn.text = 'Добавить контакт'
-            else:
-                self.add_btn.text = 'Добавить'
-            self.add_btn.disabled = False
+    def on_search(self, text):
+        if not text:
+            if self.is_searching:
+                self.is_searching = False
+                self.proxy_model.setFilterFixedString("")
+                self.tree.collapseAll()
+                self.restore_expanded_nodes()
+                self.saved_expanded_nodes.clear()
         else:
-            self.add_btn.text = 'Добавить'
-            self.add_btn.disabled = True
+            if not self.is_searching:
+                self.is_searching = True
+                self.saved_expanded_nodes = self.get_expanded_nodes()
             
-        self.delete_btn.disabled = not has
-        self.edit_btn.disabled = (count != 1)
-        
-        if count == 1 and n and n.node_type in ('contact_dm', 'contact_pay'):
-            self.change_type_btn.disabled = False
-        else:
-            self.change_type_btn.disabled = True
+            self.proxy_model.setFilterFixedString(text)
+            self.tree.expandAll()
 
-    def refresh_view(self, keep_scroll=False, keep_selection=False):
-        self._last_counts = self.db.get_counts()
-        scroll_y = self.scroll.scroll_y if keep_scroll else 1.0
-        self.list_layout.clear_widgets()
-        self.current_rows.clear()
-        
-        if not keep_selection:
-            self.selected_node = None
-            self.selected_key = None
-            self.selected_keys = []
-            self.anchor_index = None
-            self.current_index = None
-
-        text = self.search_input.text.strip() if self.search_input else ''
-        if text:
-            self._build_filtered(text)
-        else:
-            self._build_full()
-
-        for row in self.current_rows:
-            if not row.is_header and (row.node_type, row.db_id) in self.selected_keys:
-                row.set_selected(True)
-            else:
-                row.set_selected(False)
-
-        self.update_buttons()
-        self._update_status()
-        
-        Clock.schedule_once(lambda dt: setattr(self.scroll, 'scroll_y', max(0.0, min(1.0, scroll_y))), 0.05)
-
-    def _update_status(self):
-        if not self.status_label:
-            return
+    def update_status(self):
         c = self.db.get_counts()
-        self.status_label.text = (
+        self.status_label.setText(
             f"Ответственных: {c['rp']}  |  Организаций: {c['org']}  |  "
-            f"Магазинов: {c['store']}  |  Контактов: {c['contact']}")
+            f"Магазинов: {c['store']}  |  Контактов: {c['contact']}"
+        )
 
-    def _row(self, node_type, db_id, level, col1_parts, c2, c3, c4, c5,
-             expandable=False, expanded=False, is_header=False, highlight=None):
-        r = ExcelRow(self, node_type, db_id, level, col1_parts, c2, c3, c4, c5,
-                     expandable=expandable, expanded=expanded,
-                     is_header=is_header, highlight=highlight)
-        self.list_layout.add_widget(r)
-        self.current_rows.append(r)
-        return r
+        local_db_path = os.path.abspath(os.path.join(app_dir(), 'contacts.db'))
+        current_db_path = os.path.abspath(self.db.db_name)
 
-    def _build_full(self):
-        for rp in self.db.get_responsible_persons(self.sort_key, self.sort_dir):
-            orgs = self.db.get_organizations(rp['id'], self.sort_key, self.sort_dir)
-            is_exp = ('rp', rp['id']) in self.expanded
-            self._row('rp', rp['id'], 0,
-                      [("Ответственный", 0.35), (rp['full_name'], 0.65)],
-                      rp['city'] or '-', '', rp['position'] or '-', rp['phone'] or '-',
-                      expandable=True, expanded=is_exp)
-            if is_exp:
-                for org in orgs:
-                    stores = self.db.get_stores(org['id'], self.sort_key, self.sort_dir)
-                    is_exp_org = ('org', org['id']) in self.expanded
-                    self._row('org', org['id'], 1,
-                              [("Организация", 0.35), (org['name'], 0.65)],
-                              org['contract_number'] or '-',
-                              org['contract_date'] or '-',
-                              org['address'] or '-', org['phone'] or '-',
-                              expandable=True, expanded=is_exp_org)
-                    if is_exp_org:
-                        for st in stores:
-                            is_exp_st = ('store', st['id']) in self.expanded
-                            self._row('store', st['id'], 2,
-                                      [("Магазин", 0.35), (st['name'], 0.65)],
-                                      '', '', st['unloading_address'] or '-',
-                                      st['phone'] or '-',
-                                      expandable=True, expanded=is_exp_st)
-                            if is_exp_st:
-                                self._add_store_children(st)
-                                
-    def _clamp_scroll_y(self, instance, value):
-        if value > 1.0:
-            instance.scroll_y = 1.0
-        elif value < 0.0:
-            instance.scroll_y = 0.0
-
-    def _add_store_children(self, store):
-        self._row('header', 0, 3, [("Контакты ЛПР", 1.0)], '', '', '', '',
-                  is_header=True)
-        for c in self.db.get_contacts(store['id'], 'decision_maker',
-                                      self.sort_key, self.sort_dir):
-            self._row('contact_dm', c['id'], 4,
-                      [("ФИО", 0.35), (c['full_name'] or '-', 0.65)],
-                      '', '', c['position'] or '-', c['phone'] or '-')
-        self._row('header', 0, 3, [("Контакты оплаты", 1.0)], '', '', '', '',
-                  is_header=True)
-        for c in self.db.get_contacts(store['id'], 'payment',
-                                      self.sort_key, self.sort_dir):
-            self._row('contact_pay', c['id'], 4,
-                      [("ФИО", 0.35), (c['full_name'] or '-', 0.65)],
-                      '', '', c['position'] or '-', c['phone'] or '-')
-
-    def _build_filtered(self, text):
-        tl = text.lower()
-        for rp in self.db.get_responsible_persons(self.sort_key, self.sort_dir):
-            rp_match = any(tl in (rp[f] or '').lower()
-                           for f in ('full_name', 'city', 'position', 'phone'))
-            orgs_data = []
-            for org in self.db.get_organizations(rp['id'], self.sort_key, self.sort_dir):
-                org_match = any(tl in (org[f] or '').lower()
-                                for f in ('name', 'address', 'phone',
-                                          'contract_number', 'contract_date'))
-                stores_data = []
-                for st in self.db.get_stores(org['id'], self.sort_key, self.sort_dir):
-                    st_match = any(tl in (st[f] or '').lower()
-                                   for f in ('name', 'unloading_address', 'phone'))
-                    contacts = []
-                    for c in self.db.get_all_contacts(st['id']):
-                        if any(tl in (c[f] or '').lower()
-                               for f in ('full_name', 'position', 'phone')):
-                            contacts.append(c)
-                            st_match = True
-                    if st_match or contacts:
-                        stores_data.append((st, contacts))
-                        org_match = True
-                if org_match or stores_data:
-                    orgs_data.append((org, stores_data))
-            if rp_match or orgs_data:
-                self._row('rp', rp['id'], 0,
-                          [("Ответственный", 0.35), (rp['full_name'], 0.65)],
-                          rp['city'] or '-', '', rp['position'] or '-',
-                          rp['phone'] or '-', expandable=True, expanded=True,
-                          highlight=text)
-                for org, stores_data in orgs_data:
-                    self._row('org', org['id'], 1,
-                              [("Организация", 0.35), (org['name'], 0.65)],
-                              org['contract_number'] or '-',
-                              org['contract_date'] or '-',
-                              org['address'] or '-', org['phone'] or '-',
-                              expandable=True, expanded=True, highlight=text)
-                    for st, contacts in stores_data:
-                        self._row('store', st['id'], 2,
-                                  [("Магазин", 0.35), (st['name'], 0.65)],
-                                  '', '', st['unloading_address'] or '-',
-                                  st['phone'] or '-', expandable=True,
-                                  expanded=True, highlight=text)
-                        for c in contacts:
-                            ntype = ('contact_dm' if c['contact_type'] == 'decision_maker'
-                                     else 'contact_pay')
-                            ctype = 'ЛПР' if c['contact_type'] == 'decision_maker' else 'Оплата'
-                            self._row(ntype, c['id'], 4,
-                                      [("ФИО", 0.35), (c['full_name'] or '-', 0.65)],
-                                      '', '', c['position'] or '-',
-                                      f"{c['phone'] or '-'} ({ctype})",
-                                      highlight=text)
-
-    def _on_search(self, *args):
-        Clock.unschedule(self._do_search)
-        Clock.schedule_once(self._do_search, 0.3)
-
-    def _do_search(self, dt):
-        self.refresh_view()
-
-    # ---------- Actions ----------
-    def on_add(self, *args):
-        if len(self.selected_keys) > 1: return
-        n = self.selected_node
-        if not n:
-            self._add_rp()
-        elif n.node_type == 'rp':
-            self._add_organization(n.db_id)
-        elif n.node_type == 'org':
-            self._add_store(n.db_id)
-        elif n.node_type == 'store':
-            ContactTypePopup(on_choice=lambda t: self._add_contact(n.db_id, t)).open()
-
-    def on_edit(self, *args):
-        if len(self.selected_keys) != 1: return
-        n = self.selected_node
-        if not n: return
-        {'rp': self._edit_rp, 'org': self._edit_org, 'store': self._edit_store,
-         'contact_dm': self._edit_contact, 'contact_pay': self._edit_contact
-         }.get(n.node_type, lambda x: None)(n.db_id)
-
-    def on_delete(self, *args):
-        if len(self.selected_keys) == 0: return
-        
-        if len(self.selected_keys) == 1:
-            n = self.selected_node
-            self._confirm_delete(n.node_type, n.db_id)
+        if current_db_path == local_db_path:
+            self.db_status_label.setText("💾 База: Локальная")
+            self.db_status_label.setStyleSheet("color: #55aaff; font-size: 14px; font-weight: bold;")
+            self.db_status_label.setToolTip(current_db_path)
         else:
-            ConfirmPopup(f"Удалить выбранные элементы ({len(self.selected_keys)} шт.)?", 
-                         self._delete_selected).open()
+            self.db_status_label.setText("🌐 База: Сетевая")
+            self.db_status_label.setStyleSheet("color: #458a00; font-size: 14px; font-weight: bold;")
+            self.db_status_label.setToolTip(current_db_path) 
 
-    def _delete_selected(self):
-        order = {'contact_dm': 4, 'contact_pay': 4, 'store': 3, 'org': 2, 'rp': 1}
-        sorted_keys = sorted(self.selected_keys, key=lambda x: order.get(x[0], 0), reverse=True)
+    def get_selected_data(self):
+        indexes = self.tree.selectionModel().selectedRows()
+        if not indexes: return None
+        source_idx = self.proxy_model.mapToSource(indexes[0])
+        item = self.model.itemFromIndex(source_idx)
+        return item.data(Qt.UserRole)
+
+    def on_selection_changed(self, selected, deselected):
+        data = self.get_selected_data()
+        has_sel = len(self.tree.selectionModel().selectedRows()) > 0
         
-        for n_type, n_id in sorted_keys:
-            if n_type in ('contact_dm', 'contact_pay'):
-                self.db.delete_contact(n_id)
-            elif n_type == 'store':
-                self.db.delete_store(n_id)
-            elif n_type == 'org':
-                self.db.delete_organization(n_id)
-            elif n_type == 'rp':
-                self.db.delete_responsible_person(n_id)
+        if not data:
+            self.btn_add.setEnabled(True)
+            self.btn_add.setText("Добавить ответственного")
+            self.btn_edit.setEnabled(False)
+            self.btn_delete.setEnabled(False)
+            self.btn_change_type.setEnabled(False)
+            return
+
+        ntype = data[0]
+        is_contact = ntype in ('contact_dm', 'contact_pay')
+        is_header = ntype == 'header'
+        
+        self.btn_delete.setEnabled(has_sel and not is_header)
+        self.btn_edit.setEnabled(len(self.tree.selectionModel().selectedRows()) == 1 and not is_header)
+        self.btn_change_type.setEnabled(is_contact)
+        
+        if is_contact:
+            self.btn_add.setEnabled(False)
+            self.btn_add.setText("Добавить")
+        elif is_header:
+            self.btn_add.setEnabled(True)
+            self.btn_add.setText("Добавить контакт")
+        elif ntype == 'store':
+            self.btn_add.setEnabled(True)
+            self.btn_add.setText("Добавить контакт")
+        else:
+            self.btn_add.setEnabled(True)
+            if ntype == 'rp': self.btn_add.setText("Добавить организацию")
+            elif ntype == 'org': self.btn_add.setText("Добавить магазин")
+
+    def copy_selected(self):
+        indexes = self.tree.selectionModel().selectedRows()
+        if not indexes: return
+        lines = []
+        for idx in indexes:
+            row_data = []
+            for col in range(6):
+                col_idx = self.proxy_model.index(idx.row(), col, idx.parent())
+                row_data.append(col_idx.data(Qt.DisplayRole))
                 
-        self.refresh_view()
-
-    def _confirm_delete(self, node_type, db_id):
-        msg = {
-            'rp': 'Удалить ответственное лицо со всей информацией?',
-            'org': 'Удалить организацию со всеми магазинами?',
-            'store': 'Удалить магазин со всеми контактами?',
-            'contact_dm': 'Удалить контакт ЛПР?',
-            'contact_pay': 'Удалить контакт оплаты?',
-        }.get(node_type, 'Удалить?')
-        ConfirmPopup(msg, lambda: self._delete_by(node_type, db_id)).open()
-
-    def _delete_by(self, node_type, db_id):
-        if node_type == 'rp':
-            self.db.delete_responsible_person(db_id)
-        elif node_type == 'org':
-            self.db.delete_organization(db_id)
-        elif node_type == 'store':
-            self.db.delete_store(db_id)
-        else:
-            self.db.delete_contact(db_id)
-        self.refresh_view()
-
-    def on_change_contact_type(self, *args):
-        if len(self.selected_keys) != 1: return
-        n = self.selected_node
-        if not n or n.node_type not in ('contact_dm', 'contact_pay'):
-            return
+                src_idx = self.proxy_model.mapToSource(col_idx)
+                item = self.model.itemFromIndex(src_idx)
+                self.flash_item(item)
+                
+            lines.append("\t".join(row_data))
         
-        cur = self.db.get_contact(n.db_id)
-        if not cur:
-            return
-        
-        def do_change(t):
-            self._do_change_contact_type(n.db_id, t)
-            
-        ContactTypePopup(
-            title='Сменить тип контакта',
-            current_type=cur['contact_type'],
-            on_choice=do_change
-        ).open()
-        
-    def _do_change_contact_type(self, contact_id, new_type):
-        self.db.change_contact_type(contact_id, new_type)
-        self.refresh_view()
+        QApplication.clipboard().setText("\r\n".join(lines))
+        self.status_label.setText(f"Скопировано строк: {len(indexes)}")
+        QTimer.singleShot(3000, self.update_status)
 
-    def export_data(self, *args):
-        export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
-        filepath = os.path.join(export_dir, 'contacts_export.xlsx')
-        
-        try:
-            os.makedirs(export_dir, exist_ok=True)
-            export_to_excel(self.db, filepath=filepath)
-            InfoPopup("Успех", f"Данные сохранены:\n{filepath}").open()
-        except PermissionError:
-            InfoPopup("Ошибка", 
-                      f"Не удалось сохранить файл.\n\n"
-                      f"Файл открыт в другой программе (например, в Excel):\n"
-                      f"{filepath}\n\n"
-                      f"Закройте файл и повторите попытку.").open()
-        except Exception as e:
-            log.exception("Export failed")
-            InfoPopup("Ошибка", f"Не удалось сохранить файл.\n\n{e}").open()
-
-    def show_trash(self, *args):
-        TrashPopup(self.db, self.refresh_view).open()
+    def on_add(self):
+        data = self.get_selected_data()
+        if not data: 
+            self._add_rp()
+        elif data[0] == 'rp': 
+            self._add_org(data[1])
+        elif data[0] == 'org': 
+            self._add_store(data[1])
+        elif data[0] == 'store': 
+            self._add_contact(data[1])
+        elif data[0] == 'header':
+            self._add_contact(data[2], data[1])
 
     def _add_rp(self):
-        def save(data):
-            if not data['full_name']:
-                return False
-            new_id = self.db.add_responsible_person(
-                data['full_name'], data['city'], data['position'], data['phone'])
-            self.refresh_view()
-            self.select_row('rp', new_id)
-            return True
-        FormPopup('Новое ответственное лицо',
-                  [('full_name', 'ФИО'), ('city', 'Город'),
-                   ('position', 'Должность'), ('phone', 'Телефон')],
-                  save, validators={'phone': _phone_validator}).open()
+        dlg = FormDialog("Новое ответственное лицо", [('full_name', 'ФИО'), ('city', 'Город'), ('position', 'Должность'), ('phone', 'Телефон')], {'phone': _phone_validator})
+        if dlg.exec():
+            d = dlg.get_data()
+            if d['full_name']:
+                new_id = self.db.add_responsible_person(d['full_name'], d['city'], d['position'], d['phone'])
+                new_row = self.make_row("Ответственный", d['full_name'], d['city'] or '-', '', d['position'] or '-', d['phone'] or '-', ('rp', new_id))
+                self.model.invisibleRootItem().appendRow(new_row)
+                self._select_item(('rp', new_id))
+                self.update_status()
 
-    def _add_organization(self, rp_id):
-        def save(data):
-            if not data['name']:
-                return False
-            new_id = self.db.add_organization(
-                rp_id, data['name'], data['address'], data['phone'],
-                data['contract_number'], data['contract_date'])
-            self.expanded.add(('rp', rp_id))
-            self.refresh_view()
-            self.select_row('org', new_id)
-            return True
-        FormPopup('Новая организация',
-                  [('name', 'Название'), ('contract_number', '№ договора'),
-                   ('contract_date', 'Дата договора'),
-                   ('address', 'Адрес'), ('phone', 'Телефон')],
-                  save, validators={'phone': _phone_validator,
-                                    'contract_date': _date_validator}).open()
+    def _add_org(self, rp_id):
+        dlg = FormDialog("Новая организация", [('name', 'Название'), ('contract_number', '№ договора'), ('contract_date', 'Дата договора'), ('address', 'Адрес'), ('phone', 'Телефон')], {'phone': _phone_validator, 'contract_date': _date_validator})
+        if dlg.exec():
+            d = dlg.get_data()
+            if d['name']:
+                new_id = self.db.add_organization(rp_id, d['name'], d['address'], d['phone'], d['contract_number'], d['contract_date'])
+                new_row = self.make_row("Организация", d['name'], d['contract_number'] or '-', d['contract_date'] or '-', d['address'] or '-', d['phone'] or '-', ('org', new_id))
+                rp_item = self._get_item_by_key(('rp', rp_id))
+                if rp_item:
+                    rp_item.appendRow(new_row)
+                    self._select_item(('org', new_id))
+                    self.update_status()
 
     def _add_store(self, org_id):
-        def save(data):
-            if not data['name']:
-                return False
-            new_id = self.db.add_store(org_id, data['name'],
-                                       data['address'], data['phone'])
-            self.expanded.add(('org', org_id))
-            self.refresh_view()
-            self.select_row('store', new_id)
-            return True
-        FormPopup('Новый магазин',
-                  [('name', 'Название'), ('address', 'Адрес разгрузки'),
-                   ('phone', 'Телефон')],
-                  save, validators={'phone': _phone_validator}).open()
+        dlg = FormDialog("Новый магазин", [('name', 'Название'), ('address', 'Адрес разгрузки'), ('phone', 'Телефон')], {'phone': _phone_validator})
+        if dlg.exec():
+            d = dlg.get_data()
+            if d['name']:
+                new_id = self.db.add_store(org_id, d['name'], d['address'], d['phone'])
+                new_row = self.make_row("Магазин", d['name'], '', '', d['address'] or '-', d['phone'] or '-', ('store', new_id))
+                org_item = self._get_item_by_key(('org', org_id))
+                if org_item:
+                    org_item.appendRow(new_row)
+                    
+                    # Сразу создаем заголовки для контактов нового магазина
+                    font_hdr = QFont()
+                    font_hdr.setBold(True)
+                    
+                    hdr_dm_type = QStandardItem("")
+                    hdr_dm_type.setData(('header', 'decision_maker', new_id), Qt.UserRole)
+                    hdr_dm_name = QStandardItem("Контакты ЛПР")
+                    hdr_dm_name.setFont(font_hdr)
+                    hdr_dm_name.setForeground(QBrush(QColor(C_HEADER_TEXT)))
+                    row_dm = [hdr_dm_type, hdr_dm_name, QStandardItem(""), QStandardItem(""), QStandardItem(""), QStandardItem("")]
+                    new_row[0].appendRow(row_dm)
+                    
+                    hdr_pay_type = QStandardItem("")
+                    hdr_pay_type.setData(('header', 'payment', new_id), Qt.UserRole)
+                    hdr_pay_name = QStandardItem("Контакты оплаты")
+                    hdr_pay_name.setFont(font_hdr)
+                    hdr_pay_name.setForeground(QBrush(QColor(C_HEADER_TEXT)))
+                    row_pay = [hdr_pay_type, hdr_pay_name, QStandardItem(""), QStandardItem(""), QStandardItem(""), QStandardItem("")]
+                    new_row[0].appendRow(row_pay)
+                    
+                    self._select_item(('store', new_id))
+                    self.update_status()
 
-    def _add_contact(self, store_id, ctype):
+    def _add_contact(self, store_id, preset_type=None):
+        if preset_type:
+            ctype = preset_type
+        else:
+            dlg = ContactTypeDialog()
+            if dlg.exec() and dlg.get_choice():
+                ctype = dlg.get_choice()
+            else:
+                return
+
         title = 'ЛПР' if ctype == 'decision_maker' else 'Оплата'
-        def save(data):
-            if not data['full_name']:
-                return False
-            new_id = self.db.add_contact(store_id, ctype,
-                                         data['full_name'],
-                                         data['position'], data['phone'])
-            self.expanded.add(('store', store_id))
-            self.refresh_view()
-            self.select_row('contact_dm' if ctype == 'decision_maker'
-                            else 'contact_pay', new_id)
-            return True
-        FormPopup(f'Новый контакт ({title})',
-                  [('full_name', 'ФИО'), ('position', 'Должность'),
-                   ('phone', 'Телефон')],
-                  save, validators={'phone': _phone_validator}).open()
+        f_dlg = FormDialog(f"Новый контакт ({title})", [('full_name', 'ФИО'), ('position', 'Должность'), ('phone', 'Телефон')], {'phone': _phone_validator})
+        
+        if f_dlg.exec():
+            d = f_dlg.get_data()
+            if d['full_name']:
+                new_id = self.db.add_contact(store_id, ctype, d['full_name'], d['position'], d['phone'])
+                prefix = 'contact_dm' if ctype == 'decision_maker' else 'contact_pay'
+                new_row = self.make_row("", d['full_name'], '', '', d['position'] or '-', d['phone'] or '-', (prefix, new_id))
+                hdr_item = self._get_item_by_key(('header', ctype, store_id))
+                if hdr_item:
+                    hdr_item.appendRow(new_row)
+                    self._select_item((prefix, new_id))
+                    self.update_status()
+
+    def on_edit(self):
+        data = self.get_selected_data()
+        if not data or data[0] == 'header': return
+        ntype, db_id = data
+        if ntype == 'rp': self._edit_rp(db_id)
+        elif ntype == 'org': self._edit_org(db_id)
+        elif ntype == 'store': self._edit_store(db_id)
+        elif ntype in ('contact_dm', 'contact_pay'): self._edit_contact(db_id)
 
     def _edit_rp(self, rp_id):
         cur = self.db.get_rp(rp_id)
         if not cur: return
-        def save(data):
-            self.db.update_responsible_person(rp_id, data['full_name'],
-                                              data['city'], data['position'],
-                                              data['phone'])
-            self.refresh_view(); self.select_row('rp', rp_id)
-            return True
-        FormPopup('Редактирование отв. лица',
-                  [('full_name', 'ФИО'), ('city', 'Город'),
-                   ('position', 'Должность'), ('phone', 'Телефон')],
-                  save, cur, validators={'phone': _phone_validator}).open()
+        dlg = FormDialog("Редактирование отв. лица", [('full_name', 'ФИО'), ('city', 'Город'), ('position', 'Должность'), ('phone', 'Телефон')], {'phone': _phone_validator}, initial=cur)
+        if dlg.exec():
+            d = dlg.get_data()
+            self.db.update_responsible_person(rp_id, d['full_name'], d['city'], d['position'], d['phone'])
+            item = self._get_item_by_key(('rp', rp_id))
+            if item:
+                parent = item.parent() if item.parent() else self.model.invisibleRootItem()
+                row = item.row()
+                parent.child(row, 1).setText(d['full_name'])
+                parent.child(row, 2).setText(d['city'] or '-')
+                parent.child(row, 4).setText(d['position'] or '-')
+                parent.child(row, 5).setText(d['phone'] or '-')
+                self._select_item(('rp', rp_id))
 
     def _edit_org(self, org_id):
         cur = self.db.get_org(org_id)
         if not cur: return
-        def save(data):
-            self.db.update_organization(org_id, data['name'], data['address'],
-                                        data['phone'], data['contract_number'],
-                                        data['contract_date'])
-            self.refresh_view(); self.select_row('org', org_id)
-            return True
-        FormPopup('Редактирование организации',
-                  [('name', 'Название'), ('contract_number', '№ договора'),
-                   ('contract_date', 'Дата договора'), ('address', 'Адрес'),
-                   ('phone', 'Телефон')],
-                  save, cur, validators={'phone': _phone_validator,
-                                         'contract_date': _date_validator}).open()
+        dlg = FormDialog("Редактирование организации", [('name', 'Название'), ('contract_number', '№ договора'), ('contract_date', 'Дата договора'), ('address', 'Адрес'), ('phone', 'Телефон')], {'phone': _phone_validator, 'contract_date': _date_validator}, initial=cur)
+        if dlg.exec():
+            d = dlg.get_data()
+            self.db.update_organization(org_id, d['name'], d['address'], d['phone'], d['contract_number'], d['contract_date'])
+            item = self._get_item_by_key(('org', org_id))
+            if item:
+                parent = item.parent() if item.parent() else self.model.invisibleRootItem()
+                row = item.row()
+                parent.child(row, 1).setText(d['name'])
+                parent.child(row, 2).setText(d['contract_number'] or '-')
+                parent.child(row, 3).setText(d['contract_date'] or '-')
+                parent.child(row, 4).setText(d['address'] or '-')
+                parent.child(row, 5).setText(d['phone'] or '-')
+                self._select_item(('org', org_id))
 
     def _edit_store(self, store_id):
         cur = self.db.get_store(store_id)
         if not cur: return
-        def save(data):
-            self.db.update_store(store_id, data['name'], data['address'],
-                                 data['phone'])
-            self.refresh_view(); self.select_row('store', store_id)
-            return True
-        FormPopup('Редактирование магазина',
-                  [('name', 'Название'), ('address', 'Адрес разгрузки'),
-                   ('phone', 'Телефон')],
-                  save, cur, validators={'phone': _phone_validator}).open()
+        dlg = FormDialog("Редактирование магазина", [('name', 'Название'), ('address', 'Адрес разгрузки'), ('phone', 'Телефон')], {'phone': _phone_validator}, initial=cur)
+        if dlg.exec():
+            d = dlg.get_data()
+            self.db.update_store(store_id, d['name'], d['address'], d['phone'])
+            item = self._get_item_by_key(('store', store_id))
+            if item:
+                parent = item.parent() if item.parent() else self.model.invisibleRootItem()
+                row = item.row()
+                parent.child(row, 1).setText(d['name'])
+                parent.child(row, 4).setText(d['address'] or '-')
+                parent.child(row, 5).setText(d['phone'] or '-')
+                self._select_item(('store', store_id))
 
     def _edit_contact(self, contact_id):
         cur = self.db.get_contact(contact_id)
         if not cur: return
-        def save(data):
-            self.db.update_contact(contact_id, data['full_name'],
-                                   data['position'], data['phone'])
-            ntype = ('contact_dm' if cur['contact_type'] == 'decision_maker'
-                     else 'contact_pay')
-            self.refresh_view(); self.select_row(ntype, contact_id)
-            return True
-        FormPopup('Редактирование контакта',
-                  [('full_name', 'ФИО'), ('position', 'Должность'),
-                   ('phone', 'Телефон')],
-                  save, cur, validators={'phone': _phone_validator}).open()
+        dlg = FormDialog("Редактирование контакта", [('full_name', 'ФИО'), ('position', 'Должность'), ('phone', 'Телефон')], {'phone': _phone_validator}, initial=cur)
+        if dlg.exec():
+            d = dlg.get_data()
+            self.db.update_contact(contact_id, d['full_name'], d['position'], d['phone'])
+            prefix = 'contact_dm' if cur['contact_type'] == 'decision_maker' else 'contact_pay'
+            item = self._get_item_by_key((prefix, contact_id))
+            if item:
+                parent = item.parent() if item.parent() else self.model.invisibleRootItem()
+                row = item.row()
+                parent.child(row, 1).setText(d['full_name'])
+                parent.child(row, 4).setText(d['position'] or '-')
+                parent.child(row, 5).setText(d['phone'] or '-')
+                self._select_item((prefix, contact_id))
 
-    def show_about(self, *args):
-        AboutPopup(text=ABOUT_TEXT,
-                   repo_url="https://github.com/Londimain/Organization-Contacts-Manager").open()
+    def on_delete(self):
+        indexes = self.tree.selectionModel().selectedRows()
+        if not indexes: return
+        
+        def do_delete():
+            data_list = []
+            for idx in indexes:
+                src_idx = self.proxy_model.mapToSource(idx)
+                item = self.model.itemFromIndex(src_idx)
+                data = item.data(Qt.UserRole)
+                if data and data[0] != 'header':
+                    data_list.append(data)
+            
+            order = {'contact_dm': 4, 'contact_pay': 4, 'store': 3, 'org': 2, 'rp': 1}
+            data_list.sort(key=lambda x: order.get(x[0], 0), reverse=True)
+            
+            for ntype, db_id in data_list:
+                if ntype in ('contact_dm', 'contact_pay'): self.db.delete_contact(db_id)
+                elif ntype == 'store': self.db.delete_store(db_id)
+                elif ntype == 'org': self.db.delete_organization(db_id)
+                elif ntype == 'rp': self.db.delete_responsible_person(db_id)
+                
+                item = self._get_item_by_key((ntype, db_id))
+                if item:
+                    parent = item.parent()
+                    if parent:
+                        parent.removeRow(item.row())
+                    else:
+                        self.model.invisibleRootItem().removeRow(item.row())
+            
+            self.update_status()
 
-    def on_stop(self):
+        msg = f"Удалить выбранные элементы ({len(indexes)} шт.)?" if len(indexes) > 1 else "Удалить выбранный элемент?"
+        dlg = ConfirmDialog(msg, "Удалить")
+        if dlg.exec():
+            do_delete()
+
+    def on_change_type(self):
+        data = self.get_selected_data()
+        if not data or data[0] not in ('contact_dm', 'contact_pay'): return
+        cur = self.db.get_contact(data[1])
+        dlg = ContactTypeDialog(current_type=cur['contact_type'])
+        
+        if dlg.exec() and dlg.get_choice():
+            new_type = dlg.get_choice()
+            self.db.change_contact_type(data[1], new_type)
+            
+            item = self._get_item_by_key(data)
+            if item:
+                parent = item.parent()
+                row_idx = item.row()
+                row_data = [parent.child(row_idx, col).text() for col in range(6)]
+                db_id = data[1]
+                
+                parent.removeRow(row_idx)
+                
+                prefix = 'contact_dm' if new_type == 'decision_maker' else 'contact_pay'
+                new_row = self.make_row("", row_data[1], '', '', row_data[4], row_data[5], (prefix, db_id))
+                
+                store_id = cur['store_id']
+                hdr_item = self._get_item_by_key(('header', new_type, store_id))
+                if hdr_item:
+                    hdr_item.appendRow(new_row)
+                    self._select_item((prefix, db_id))
+                    self.update_status()
+
+    def export_data(self):
+        export_dir = os.path.join(get_desktop_path(), 'Экспорт контактов')
+        filepath = os.path.join(export_dir, 'contacts_export.xlsx')
         try:
-            if not self.settings.get('maximized', True):
-                self.settings['window_size'] = list(Window.size)
-            save_settings(self.settings)
+            os.makedirs(export_dir, exist_ok=True)
+            export_to_excel(self.db, filepath=filepath)
+            InfoDialog("Успех", f"Данные сохранены:\n{filepath}").exec()
         except Exception as e:
-            log.warning(f"Save settings failed: {e}")
-        if self.db:
+            InfoDialog("Ошибка", f"Не удалось сохранить файл.\n\n{e}").exec()
+
+    def import_data(self):
+        filepath, _ = QFileDialog.getOpenFileName(self, "Импорт из Excel", "", "Excel Files (*.xlsx)")
+        if not filepath: return
+        
+        self.loading_dlg = LoadingDialog("Импорт данных...\nПожалуйста, подождите.")
+        self.loading_dlg.setWindowModality(Qt.ApplicationModal) 
+        self.loading_dlg.show()
+        
+        self.import_thread = ImportThread(self.db, filepath)
+        self.import_thread.finished_signal.connect(self.on_import_finished)
+        self.import_thread.error_signal.connect(self.on_import_error)
+        self.import_thread.start()
+
+    def on_import_finished(self, added, updated, skipped):
+        try:
+            self.refresh_view(show_cursor=False)
+        except Exception as e:
+            log.error(f"Error refreshing view after import: {e}")
+            
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Импорт завершён", f"Добавлено: {added}\nОбновлено: {updated}\nПропущено: {skipped}").exec()
+
+    def on_import_error(self, error_msg):
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Ошибка импорта", f"Не удалось импортировать данные:\n\n{error_msg}").exec()
+
+    def show_settings(self):
+        dlg = SettingsDialog(self, self.db.db_name)
+        if dlg.exec():
+            new_path = dlg.get_path()
+            settings_data = load_settings()
+            
+            if not new_path:
+                settings_data['db_path'] = ""
+                actual_path = os.path.join(app_dir(), 'contacts.db')
+            else:
+                settings_data['db_path'] = new_path
+                actual_path = new_path
+                
+            save_settings(settings_data)
+            
+            if os.path.abspath(self.db.db_name) != os.path.abspath(actual_path):
+                
+                self.loading_dlg = LoadingDialog("Подключение к новой базе данных...\nПожалуйста, подождите.")
+                self.loading_dlg.setWindowModality(Qt.ApplicationModal) 
+                self.loading_dlg.show()
+                
+                self.switch_thread = SwitchDbThread(actual_path)
+                self.switch_thread.finished_signal.connect(self.on_db_switched)
+                self.switch_thread.error_signal.connect(self.on_db_switch_error)
+                self.switch_thread.start()
+
+    def on_db_switched(self, new_db):
+        self.db = new_db
+        
+        self.search_input.clear()
+        self.refresh_view(show_cursor=False)
+        
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Успех", f"База данных успешно изменена.\nТекущий путь:\n{self.db.db_name}").exec()
+
+    def on_db_switch_error(self, error_msg):
+        if hasattr(self, 'loading_dlg') and self.loading_dlg:
+            self.loading_dlg.accept()
+            self.loading_dlg = None
+            
+        InfoDialog("Ошибка", f"Не удалось подключиться к базе:\n{error_msg}").exec()
+                    
+    def show_trash(self):
+        dlg = TrashDialog(self.db)
+        if dlg.exec():
+            self.refresh_view()
+
+    def show_about(self):
+        AboutDialog(REPO_URL).exec()
+
+    def closeEvent(self, event):
+        dlg = ConfirmDialog("Вы уверены, что хотите выйти?", "Выйти")
+        if dlg.exec():
             self.db.close()
+            event.accept()
+        else:
+            event.ignore()

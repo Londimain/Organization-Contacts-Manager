@@ -5,16 +5,17 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
+from kivy.properties import BooleanProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
+from kivy.uix.popup import Popup
 from kivy.graphics import Color, Rectangle, Line
 from constants import *
 
 
 def _escape_markup(text):
-    """Экранирование символов Kivy-markup."""
     return (str(text)
             .replace('&', '&amp;')
             .replace('[', '&bl;')
@@ -22,7 +23,6 @@ def _escape_markup(text):
 
 
 def _hl_text(text, needle):
-    """Подсветка совпадений через markup."""
     text = '' if text is None else str(text)
     if not needle or not text:
         return _escape_markup(text)
@@ -44,44 +44,130 @@ def _make_text(text, highlight=None, markup=False):
     return str(text) if text is not None else ''
 
 
-class CustomButton(Button):
+class HoverBehavior(object):
+    hovered = BooleanProperty(False)
+
+    def __init__(self, **kwargs):
+        self.register_event_type('on_enter')
+        self.register_event_type('on_leave')
+        super(HoverBehavior, self).__init__(**kwargs)
+        self._mouse_bound = False
+        self.bind(parent=self._on_parent_change)
+        if self.parent is not None:
+            self._bind_mouse()
+
+    def _on_parent_change(self, instance, parent):
+        if parent is None:
+            self._unbind_mouse()
+        else:
+            self._bind_mouse()
+
+    def _bind_mouse(self):
+        if not self._mouse_bound:
+            Window.bind(mouse_pos=self._on_mouse_pos)
+            self._mouse_bound = True
+
+    def _unbind_mouse(self):
+        if self._mouse_bound:
+            Window.unbind(mouse_pos=self._on_mouse_pos)
+            self._mouse_bound = False
+            if self.hovered:
+                self.hovered = False
+                self.dispatch('on_leave')
+
+    def _on_mouse_pos(self, window, pos):
+        if not self.get_root_window():
+            return
+            
+        parent = self.parent
+        in_popup = False
+        limit = 10
+        while parent and limit > 0:
+            if isinstance(parent, Popup):
+                in_popup = True
+                break
+            parent = parent.parent
+            limit -= 1
+
+        app = App.get_running_app()
+        if app and app._popup_open() and not in_popup:
+            if self.hovered:
+                self.hovered = False
+                self.dispatch('on_leave')
+            return
+            
+        inside = self.collide_point(*self.to_widget(*pos))
+        if self.hovered == inside:
+            return
+        self.hovered = inside
+        if inside:
+            self.dispatch('on_enter')
+        else:
+            self.dispatch('on_leave')
+
+    def on_enter(self, *args):
+        pass
+
+    def on_leave(self, *args):
+        pass
+
+
+class CustomButton(HoverBehavior, Button):
     def __init__(self, **kwargs):
         kwargs.setdefault('font_size', '15sp')
         kwargs.setdefault('bold', True)
+        kwargs.setdefault('halign', 'center')
+        kwargs.setdefault('valign', 'middle')
+        kwargs.setdefault('shorten', True)
+        kwargs.setdefault('shorten_from', 'right')
         super().__init__(**kwargs)
+        
         self.background_normal = ''
         self.background_down = ''
         self.background_color = C_BTN
         self.disabled_color = C_TEXT_DISABLED
+
+        self.bind(size=lambda inst, val: setattr(inst, 'text_size', (max(0, val[0] - 10), val[1])))
+
         self.bind(disabled=self._upd_dis, state=self._upd_state)
         self.bind(pos=self._upd, size=self._upd)
+
         with self.canvas.after:
             self.border_color = Color(*C_RED_LINE)
-            self.border_rect = Line(width=1)
-        self._upd_dis(self, self.disabled)
+            self.border_rect = Line(width=1.2)
+
+        self._apply_color()
         self._upd()
+
+    def on_enter(self, *args):
+        self._apply_color()
+
+    def on_leave(self, *args):
+        self._apply_color()
+
+    def _apply_color(self):
+        if self.disabled:
+            self.background_color = C_BTN_DISABLED
+        elif self.state == 'down':
+            self.background_color = C_BTN_DOWN
+        elif self.hovered:
+            self.background_color = C_BTN_HOVER
+        else:
+            self.background_color = C_BTN
 
     def _upd(self, *a):
         if hasattr(self, 'border_rect'):
-            self.border_rect.rectangle = (self.x + 1, self.y + 1, self.width - 2, self.height - 2)
+            w, h = self.width, self.height
+            if w > 2 and h > 2:
+                self.border_rect.points = [self.x, self.y, self.x + w, self.y, self.x + w, self.y + h, self.x, self.y + h, self.x, self.y]
+            else:
+                self.border_rect.points = []
 
     def _upd_dis(self, inst, val):
-        if val:
-            self.background_color = C_BTN_DISABLED
-        else:
-            self._upd_state(self, self.state)
+        self._apply_color()
 
     def _upd_state(self, inst, val):
-        if self.disabled:
-            return
-        self.background_color = C_BTN_DOWN if val == 'down' else C_BTN
-
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            app = App.get_running_app()
-            if app:
-                app._skip_deselect = True
-        return super().on_touch_down(touch)
+        self._apply_color()
 
 
 class RootLayout(BoxLayout):
@@ -90,22 +176,23 @@ class RootLayout(BoxLayout):
             return super().on_touch_down(touch)
 
         app = App.get_running_app()
-        if app:
-            app._skip_deselect = False
-            consumed = super().on_touch_down(touch)
-            if not getattr(app, '_skip_deselect', False):
-                hit = False
-                for child in self.walk():
-                    if child.collide_point(*touch.pos) and isinstance(child, (CustomButton, TextInput)):
-                        hit = True
-                        break
-                if not hit:
-                    app.deselect_all()
-            return consumed
+        if app and app._popup_open():
+            return True
+
+        if getattr(touch, 'button', None) == 'right':
+            hit = False
+            for child in self.walk():
+                if isinstance(child, (CustomButton, TextInput, ExcelRow)) and child.collide_point(*touch.pos):
+                    hit = True
+                    break
+            if not hit:
+                app.deselect_all()
+                return True
+
         return super().on_touch_down(touch)
 
 
-class ExcelRow(BoxLayout):
+class ExcelRow(HoverBehavior, BoxLayout):
     def __init__(self, app, node_type, db_id, level, col1_parts, c2, c3, c4, c5,
                  expandable=False, expanded=False, is_header=False,
                  highlight=None, **kwargs):
@@ -117,7 +204,6 @@ class ExcelRow(BoxLayout):
         self.is_header = is_header
         self.is_selected = False
         self.last_click_time = 0
-        self._expand_event = None
         self.highlight = highlight
 
         if is_header:
@@ -155,26 +241,23 @@ class ExcelRow(BoxLayout):
 
         self.col1_weights = [w for _, w in col1_parts]
         self.col1_total = sum(self.col1_weights)
-        self.col1_box = BoxLayout(size_hint_x=0.35, orientation='horizontal')
+        self.col1_box = BoxLayout(size_hint_x=0.45, orientation='horizontal')
         with self.col1_box.canvas.after:
             self.col1_line_color = Color(*C_RED_LINE)
             self.col1_lines = [Line(width=1) for _ in range(len(col1_parts) - 1)]
         self.col1_box.bind(pos=self._upd_col1, size=self._upd_col1)
 
-        # Немного уменьшен отступ, чтобы "ФИО" не сжималось
         pad_left = level * 10 + 10
-        
+
         for i, (text, weight) in enumerate(col1_parts):
             align = 'center' if is_header else 'left'
-            
-            # Отключаем сжатие (shorten) для слова "ФИО", чтобы оно не превращалось в "Ф..."
             do_shorten = True
             if len(col1_parts) > 1 and i == 0:
                 do_shorten = False
-
             lbl = Label(text=_make_text(text, highlight, markup=True),
                         size_hint_x=weight, halign=align, valign='middle',
-                        color=C_TEXT, padding=(pad_left if not is_header and i == 0 else 10, 0),
+                        color=C_TEXT,
+                        padding=(pad_left if not is_header and i == 0 else 10, 0),
                         bold=is_header, font_size='14sp', shorten=do_shorten,
                         shorten_from='right', markup=True)
             lbl.bind(size=lbl.setter('text_size'))
@@ -183,10 +266,26 @@ class ExcelRow(BoxLayout):
 
         self.lbl2 = self._mk(c2, 0.15, is_header, 10)
         self.lbl3 = self._mk(c3, 0.10, is_header, 10)
-        self.lbl4 = self._mk(c4, 0.25, is_header, 10)
+        self.lbl4 = self._mk(c4, 0.15, is_header, 10)
         self.lbl5 = self._mk(c5, 0.15, is_header, 10)
         for l in (self.lbl2, self.lbl3, self.lbl4, self.lbl5):
             self.add_widget(l)
+
+    def on_enter(self, *args):
+        if not self.is_header:
+            self._update_bg()
+
+    def on_leave(self, *args):
+        if not self.is_header:
+            self._update_bg()
+
+    def _update_bg(self):
+        if self.is_selected:
+            self.bg_color.rgba = C_SELECTED
+        elif self.hovered:
+            self.bg_color.rgba = C_ROW_HOVER
+        else:
+            self.bg_color.rgba = self.bg_normal
 
     def _mk(self, text, hint_x, is_header, pad):
         align = 'center' if is_header else 'left'
@@ -201,108 +300,123 @@ class ExcelRow(BoxLayout):
     def _upd(self, *a):
         self.bg_rect.pos = self.pos
         self.bg_rect.size = self.size
-        self.line_rect.rectangle = (self.x + 1, self.y, self.width - 2, self.height)
-        self.line_left.points = [self.x + 1, self.y, self.x + 1, self.top]
-
-        avail = self.width - 30
-        x0 = self.x + 30
-        x1 = x0 + avail * 0.35
-        x2 = x1 + avail * 0.15
-        x3 = x2 + avail * 0.10
-        x4 = x3 + avail * 0.25
-
-        self.line_v1.points = []
-        self.line_v2.points = []
-        self.line_v3.points = []
-        self.line_v4.points = []
-
-        if self.node_type != 'header':
-            self.line_v3.points = [x3, self.y, x3, self.top]
-            self.line_v4.points = [x4, self.y, x4, self.top]
-            if self.node_type in ('rp', 'org'):
-                self.line_v1.points = [x1, self.y, x1, self.top]
-            if self.node_type == 'org':
-                self.line_v2.points = [x2, self.y, x2, self.top]
+        
+        if self.width > 2 and self.height > 2:
+            self.line_rect.points = [self.x + 1, self.y, self.x + 1, self.top, self.x + self.width - 2, self.top, self.x + self.width - 2, self.y, self.x + 1, self.y]
+            self.line_left.points = [self.x + 1, self.y, self.x + 1, self.top]
+            
+            if self.width > 30:
+                avail = self.width - 30
+                x0 = self.x + 30
+                x1 = x0 + avail * 0.45
+                x2 = x1 + avail * 0.15
+                x3 = x2 + avail * 0.10
+                x4 = x3 + avail * 0.15
+                
+                self.line_v1.points = []
+                self.line_v2.points = []
+                self.line_v3.points = []
+                self.line_v4.points = []
+                
+                if self.node_type != 'header':
+                    self.line_v3.points = [x3, self.y, x3, self.top]
+                    self.line_v4.points = [x4, self.y, x4, self.top]
+                    if self.node_type in ('rp', 'org'):
+                        self.line_v1.points = [x1, self.y, x1, self.top]
+                    if self.node_type == 'org':
+                        self.line_v2.points = [x2, self.y, x2, self.top]
+            else:
+                self.line_v1.points = []
+                self.line_v2.points = []
+                self.line_v3.points = []
+                self.line_v4.points = []
+        else:
+            self.line_rect.points = []
+            self.line_left.points = []
+            self.line_v1.points = []
+            self.line_v2.points = []
+            self.line_v3.points = []
+            self.line_v4.points = []
 
     def _upd_col1(self, *a):
-        w, h, x, y = self.col1_box.width, self.col1_box.height, self.col1_box.x, self.col1_box.y
-        cx = x
-        for i, weight in enumerate(self.col1_weights[:-1]):
-            cx += (w * weight) / self.col1_total
-            self.col1_lines[i].points = [cx, y, cx, y + h]
+        w, h = self.col1_box.width, self.col1_box.height
+        x, y = self.col1_box.x, self.col1_box.y
+        
+        if w > 2 and h > 2:
+            cx = x
+            for i, weight in enumerate(self.col1_weights[:-1]):
+                cx += (w * weight) / self.col1_total
+                self.col1_lines[i].points = [cx, y, cx, y + h]
+        else:
+            for i in range(len(self.col1_lines)):
+                self.col1_lines[i].points = []
 
     def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos):
-            if touch.is_mouse_scrolling:
-                return super().on_touch_down(touch)
+        if not self.collide_point(*touch.pos):
+            return super().on_touch_down(touch)
+        if touch.is_mouse_scrolling:
+            return super().on_touch_down(touch)
 
-            app = App.get_running_app()
-            if app:
-                app._skip_deselect = True
+        app = App.get_running_app()
+        if not app:
+            return super().on_touch_down(touch)
 
-            is_right = getattr(touch, 'button', None) == 'right'
-            now = time.time()
-            is_double = (now - self.last_click_time) < 0.3
-            
-            # Читаем модификаторы напрямую из системы (защита от залипания)
-            sys_modifiers = getattr(Window._system_keyboard, 'modifiers', [])
-            shift_held = 'shift' in sys_modifiers
-            ctrl_held = 'ctrl' in sys_modifiers
-            
-            # Синхронизируем состояние в программе
-            if not shift_held: app.shift_pressed = False
-            if not ctrl_held: app.ctrl_pressed = False
+        is_right = getattr(touch, 'button', None) == 'right'
+        now = time.time()
+        is_double = getattr(touch, 'is_double_tap', False) or (now - self.last_click_time) < 0.3
 
-            # Правый клик или двойной клик (без Shift/Ctrl) → копирование текста
-            if is_right or (is_double and not shift_held and not ctrl_held):
-                if self.is_header:
-                    return True
-                    
-                if self._expand_event:
-                    self._expand_event.cancel()
-                    self._expand_event = None
-                
+        sys_modifiers = getattr(Window._system_keyboard, 'modifiers', [])
+        shift_held = 'shift' in sys_modifiers
+        ctrl_held = 'ctrl' in sys_modifiers
+
+        if is_right:
+            if not self.is_header:
                 for child in self.walk():
                     if isinstance(child, Label) and child.collide_point(*touch.pos):
                         txt = child.text
-                        clean_txt = re.sub(r'\[.*?\]', '', txt).replace('&amp;', '&').replace('&bl;', '[').replace('&br;', ']')
+                        clean_txt = (re.sub(r'\[.*?\]', '', txt)
+                                     .replace('&amp;', '&')
+                                     .replace('&bl;', '[')
+                                     .replace('&br;', ']'))
                         if clean_txt and clean_txt.strip() not in ('-', ''):
                             Clipboard.copy(clean_txt)
-                            
-                            if not hasattr(child, '_orig_color'):
-                                child._orig_color = list(child.color)
-                                
-                            child.color = (0.5, 1, 0.5, 1)
-                            
-                            def reset_color(dt, c=child):
-                                if hasattr(c, '_orig_color'):
-                                    c.color = c._orig_color
-                                    
-                            Clock.schedule_once(reset_color, 0.3)
                         break
-                self.last_click_time = 0
-                return True
-
-            self.last_click_time = now
-
-            if not self.is_header:
-                # --- ЛОГИКА МУЛЬТИВЫДЕЛЕНИЯ ---
-                if ctrl_held:
-                    app.handle_ctrl_click(self)
-                elif shift_held:
-                    app.handle_shift_click(self)
-                else:
-                    app.select_row(self.node_type, self.db_id)
-
-            # Разворачивание — при клике в любом месте строки, если есть +/- (без Shift/Ctrl)
-            if self.toggle_lbl.text in ('+', '-') and not ctrl_held and not shift_held:
-                if self._expand_event:
-                    self._expand_event.cancel()
-                self._expand_event = Clock.schedule_once(
-                    lambda dt: app.toggle_expand(self.node_type, self.db_id), 0.20)
+                app.deselect_all()
             return True
-        return super().on_touch_down(touch)
+
+        if is_double and not self.is_header:
+            for child in self.walk():
+                if isinstance(child, Label) and child.collide_point(*touch.pos):
+                    txt = child.text
+                    clean_txt = (re.sub(r'\[.*?\]', '', txt)
+                                 .replace('&amp;', '&')
+                                 .replace('&bl;', '[')
+                                 .replace('&br;', ']'))
+                    if clean_txt and clean_txt.strip() not in ('-', ''):
+                        Clipboard.copy(clean_txt)
+                    break
+            self.last_click_time = 0
+            return True
+
+        self.last_click_time = now
+
+        if not self.is_header:
+            if ctrl_held:
+                app.handle_ctrl_click(self)
+            elif shift_held:
+                app.handle_shift_click(self)
+            else:
+                app.select_row(self.node_type, self.db_id)
+
+        if self.toggle_lbl.text in ('+', '-') and not self.is_header:
+            nt = self.node_type
+            did = self.db_id
+            Clock.schedule_once(lambda dt: app.toggle_expand(nt, did), 0.05)
+
+        return True
 
     def set_selected(self, state):
+        if self.is_selected == state:
+            return
         self.is_selected = state
-        self.bg_color.rgba = C_SELECTED if state else self.bg_normal
+        self._update_bg()
