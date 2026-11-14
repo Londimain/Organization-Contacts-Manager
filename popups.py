@@ -5,7 +5,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QLineEdit, QPushButton, QMessageBox, QListWidget,
                                QListWidgetItem, QTextBrowser, QWidget, QProgressDialog, QFileDialog)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from about import ABOUT_TEXT
 
 def _validate_phone(phone):
@@ -133,13 +133,19 @@ class AboutDialog(QDialog):
     def __init__(self, repo_url):
         super().__init__()
         self.setWindowTitle("О программе")
-        # ИСПРАВЛЕНИЕ: Увеличили ширину с 600 до 850 и высоту с 500 до 650
         self.resize(850, 650) 
         self.repo_url = repo_url
         
         layout = QVBoxLayout(self)
         text = QTextBrowser()
+        
+        # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+        text.setOpenExternalLinks(True) 
+        # ----------------------------
+        
         text.setText(ABOUT_TEXT)
+        # Убираем рамку у текстового поля, чтобы оно сливалось с фоном
+        text.setStyleSheet("QTextBrowser { background-color: #121212; border: none; }") 
         layout.addWidget(text)
 
         btn_layout = QHBoxLayout()
@@ -151,7 +157,6 @@ class AboutDialog(QDialog):
         btn_layout.addWidget(btn_close)
         layout.addLayout(btn_layout)
 
-# ИСПРАВЛЕНИЕ: Переписали InfoDialog с QMessageBox на QDialog для центрирования кнопки и смены текста
 class InfoDialog(QDialog):
     def __init__(self, title, text):
         super().__init__()
@@ -175,6 +180,31 @@ class InfoDialog(QDialog):
         btn_layout.addStretch()
         layout.addLayout(btn_layout)
 
+class ErrorDialog(QDialog):
+    def __init__(self, title, text, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(350)
+        
+        layout = QVBoxLayout(self)
+        
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setWordWrap(True)
+        layout.addWidget(lbl)
+
+        btn_layout = QHBoxLayout()
+        btn_ok = QPushButton("ОК")
+        btn_ok.setFixedWidth(120)
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(self.accept)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_ok)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+# --- ВОЗВРАЩАЕМ КЛАСС ЗАГРУЗКИ ---
 class LoadingDialog(QDialog):
     def __init__(self, text="Пожалуйста, подождите..."):
         super().__init__()
@@ -197,13 +227,11 @@ class TrashDialog(QDialog):
         layout = QVBoxLayout(self)
         self.list_widget = QListWidget()
         self.list_widget.setSelectionMode(QListWidget.ExtendedSelection)
-        # Привязываем событие изменения выделения для управления кнопкой "Восстановить"
         self.list_widget.itemSelectionChanged.connect(self.update_buttons)
         layout.addWidget(self.list_widget)
 
         btn_layout = QHBoxLayout()
         
-        # ИСПРАВЛЕНИЕ: Сохраняем кнопки как атрибуты класса (self.), чтобы иметь к ним доступ
         self.btn_restore = QPushButton("Восстановить выбранные")
         self.btn_restore.clicked.connect(self.restore)
         
@@ -232,15 +260,10 @@ class TrashDialog(QDialog):
             
         self.update_buttons()
 
-    # ИСПРАВЛЕНИЕ: Новый метод для управления активностью кнопок
     def update_buttons(self):
         has_items = self.list_widget.count() > 0
         has_selection = len(self.list_widget.selectedItems()) > 0
-        
-        # "Очистить" активна, только если есть хоть один элемент
         self.btn_purge.setEnabled(has_items)
-        
-        # "Восстановить" активна, только если выбран хотя бы один элемент
         self.btn_restore.setEnabled(has_selection)
 
     def restore(self):
@@ -268,18 +291,24 @@ class SettingsDialog(QDialog):
 
         self.path_input = QLineEdit()
         
-        # Импортируем функцию для проверки локального пути
+        # --- НОВОЕ: Отступ между полем ввода и кнопками ---
+        layout.addSpacing(15) 
+        # --------------------------------------------------
+        
         from settings import app_dir
         local_db = os.path.join(app_dir(), 'contacts.db')
         
-        # Если текущий путь совпадает с локальным, показываем пустое поле
         if os.path.abspath(self.current_path) == os.path.abspath(local_db):
             self.path_input.setText("")
             self.path_input.setPlaceholderText("Локальная база (по умолчанию)")
         else:
             self.path_input.setText(self.current_path)
-            
+
         layout.addWidget(self.path_input)
+        
+        # --- НОВОЕ: Отступ между полем ввода и кнопками ---
+        layout.addSpacing(15) 
+        # --------------------------------------------------
 
         path_btns = QHBoxLayout()
         btn_browse = QPushButton("Обзор...")
@@ -290,14 +319,24 @@ class SettingsDialog(QDialog):
         path_btns.addWidget(btn_local)
         layout.addLayout(path_btns)
 
+        # --- НОВОЕ: Небольшой отступ между рядами кнопок для красоты ---
+        layout.addSpacing(10) 
+        # --------------------------------------------------------------
+
         action_btns = QHBoxLayout()
         btn_save = QPushButton("Сохранить")
         btn_save.clicked.connect(self.accept)
+        
         btn_cancel = QPushButton("Отмена")
         btn_cancel.clicked.connect(self.reject)
-        action_btns.addStretch()
-        action_btns.addWidget(btn_save)
-        action_btns.addWidget(btn_cancel)
+        
+        # Делаем кнопки одинаковой ширины
+        action_btns.addStretch(1)               # Небольшой отступ слева
+        action_btns.addWidget(btn_save, 1)      # Ширина 1
+        action_btns.addSpacing(5)              # Отступ между кнопками
+        action_btns.addWidget(btn_cancel, 1)    # Ширина 1 (теперь такая же)
+        action_btns.addStretch(1)               # Небольшой отступ справа
+        
         layout.addLayout(action_btns)
 
     def browse_db(self):
@@ -318,3 +357,64 @@ class SettingsDialog(QDialog):
 
     def get_path(self):
         return self.path_input.text().strip()
+    
+class LoginDialog(QDialog):
+    def __init__(self, correct_password):
+        super().__init__()
+        self.correct_password = correct_password
+        self.setWindowTitle("Вход в программу")
+        self.setFixedSize(300, 170)  # <--- Увеличили высоту с 150 до 170
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15) # Немного сузим поля по краям
+        
+        lbl = QLabel("Введите пароль для доступа:")
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+        
+        self.pwd_input = QLineEdit()
+        self.pwd_input.setEchoMode(QLineEdit.Password)
+        self.pwd_input.returnPressed.connect(self.check_password)
+        layout.addWidget(self.pwd_input)
+        
+        # --- НОВОЕ: Отступ между полем ввода и кнопками ---
+        layout.addSpacing(20) 
+        # -------------------------------------------------
+        
+        btn_layout = QHBoxLayout()
+        
+        self.btn_ok = QPushButton("Войти")
+        self.btn_ok.setDefault(True)
+        self.btn_ok.clicked.connect(self.check_password)
+        
+        self.btn_cancel = QPushButton("Отмена")
+        self.btn_cancel.setAutoDefault(False)
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addWidget(self.btn_ok)
+        btn_layout.addWidget(self.btn_cancel)
+        layout.addLayout(btn_layout)
+        
+        self.pwd_input.setFocus()
+
+    def check_password(self):
+        if not self.pwd_input.isEnabled():
+            return
+
+        if self.pwd_input.text() == self.correct_password:
+            self.accept()
+        else:
+            self.pwd_input.setEnabled(False)
+            self.btn_ok.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+
+            ErrorDialog("Ошибка", "Неверный пароль! Попробуйте снова.", self).exec()
+
+            QTimer.singleShot(150, self._reset_ui)
+            
+    def _reset_ui(self):
+        self.pwd_input.setEnabled(True)
+        self.btn_ok.setEnabled(True)
+        self.btn_cancel.setEnabled(True)
+        self.pwd_input.clear()
+        self.pwd_input.setFocus()
