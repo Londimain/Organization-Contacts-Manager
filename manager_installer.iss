@@ -1,7 +1,7 @@
 ; Скрипт установщика для программы "Менеджер контактов организаций"
 
 #define MyAppName "Менеджер контактов организаций"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "ОАО ""Компания МогНат"""
 #define MyAppExeName "ManagerContacts.exe"
 #define MyAppURL "https://github.com/Londimain/Organization-Contacts-Manager"

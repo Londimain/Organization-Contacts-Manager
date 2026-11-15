@@ -85,7 +85,7 @@ class SwitchDbThread(QThread):
             self.error_signal.emit(str(e))
 
 class LoadDataThread(QThread):
-    finished_signal = Signal(object) # object для безопасной передачи списка
+    finished_signal = Signal(object) 
     error_signal = Signal(str)
 
     def __init__(self, db):
@@ -94,20 +94,45 @@ class LoadDataThread(QThread):
 
     def run(self):
         try:
+            # Делаем ВСЕГО 4 запроса, забираем всю базу разом
+            all_rps = self.db.get_responsible_persons()
+            all_orgs = self.db.get_all_organizations()
+            all_stores = self.db.get_all_stores()
+            all_contacts = self.db.get_all_contacts_for_tree()
+
+            # Строим словари для быстрого поиска (в памяти это работает мгновенно)
+            orgs_by_rp = {}
+            for org in all_orgs:
+                orgs_by_rp.setdefault(org['rp_id'], []).append(org)
+
+            stores_by_org = {}
+            for st in all_stores:
+                stores_by_org.setdefault(st['org_id'], []).append(st)
+
+            contacts_by_store = {}
+            for c in all_contacts:
+                contacts_by_store.setdefault(c['store_id'], []).append(c)
+
+            # Собираем итоговую структуру для дерева
             tree_data = []
-            for rp in self.db.get_responsible_persons():
+            for rp in all_rps:
                 rp_node = {'rp': rp, 'orgs': []}
-                for org in self.db.get_organizations(rp['id']):
+                for org in orgs_by_rp.get(rp['id'], []):
                     org_node = {'org': org, 'stores': []}
-                    for st in self.db.get_stores(org['id']):
+                    for st in stores_by_org.get(org['id'], []):
+                        st_contacts = contacts_by_store.get(st['id'], [])
+                        dm = [c for c in st_contacts if c['contact_type'] == 'decision_maker']
+                        pay = [c for c in st_contacts if c['contact_type'] == 'payment']
+                        
                         st_node = {
                             'store': st,
-                            'dm': self.db.get_contacts(st['id'], 'decision_maker'),
-                            'pay': self.db.get_contacts(st['id'], 'payment')
+                            'dm': dm,
+                            'pay': pay
                         }
                         org_node['stores'].append(st_node)
                     rp_node['orgs'].append(org_node)
                 tree_data.append(rp_node)
+
             self.finished_signal.emit(tree_data)
         except Exception as e:
             self.error_signal.emit(str(e))

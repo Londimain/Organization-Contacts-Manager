@@ -121,6 +121,37 @@ class Database:
         finally:
             conn.close()
 
+    # ---------- Оптимизированные методы для быстрой загрузки дерева ----------
+    def get_all_organizations(self):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM organizations WHERE deleted_at IS NULL ORDER BY name")
+            return c.fetchall()
+        finally:
+            conn.close()
+
+    def get_all_stores(self):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM stores WHERE deleted_at IS NULL ORDER BY name")
+            return c.fetchall()
+        finally:
+            conn.close()
+
+    def get_all_contacts_for_tree(self):
+        conn = sqlite3.connect(self.db_name, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            c = conn.cursor()
+            c.execute("SELECT * FROM contacts WHERE deleted_at IS NULL ORDER BY full_name")
+            return c.fetchall()
+        finally:
+            conn.close()
+
     # ---------- Responsible Persons ----------
     def get_responsible_persons(self, sort_key='name', sort_dir='ASC', include_deleted=False):
         conn = sqlite3.connect(self.db_name, timeout=30.0)
